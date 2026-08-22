@@ -1,0 +1,26 @@
+# Rust often needs a bit of an extra main task stack size compared to C (the default is 3K)
+# You might have to increase this further if you allocate large stack variables in the main task
+CONFIG_ESP_MAIN_TASK_STACK_SIZE=8192
+
+# Increase a bit these stack sizes as they are also a bit too small by default
+CONFIG_ESP_SYSTEM_EVENT_TASK_STACK_SIZE=4096
+CONFIG_FREERTOS_IDLE_TASK_STACKSIZE=4096
+
+# You might have to increase this further if you spawn your own Rust threads
+# that allocate large stack variables; or better yet - use
+# `std::thread::Builder::new().stack_size(XXX)` for spawning
+CONFIG_PTHREAD_TASK_STACK_SIZE_DEFAULT=4096
+
+# This board's ESP32-P4 is chip revision v1.3, an early/engineering-sample revision (< v3.0).
+# Without these, the bootloader and app are compiled assuming rev >= v3.0 silicon and crash at
+# boot with "Guru Meditation Error: Core 0 panic'ed (Illegal instruction)" right after the
+# bootloader loads the app image, before any app code runs. See esp-rs/esp-idf-sys#376.
+CONFIG_ESP32P4_SELECTS_REV_LESS_V3=y
+CONFIG_ESP32P4_REV_MIN_100=y
+
+# esp_hosted (SDIO link to the onboard ESP32-C6) recommends a 1000Hz FreeRTOS tick to avoid bus
+# jitter causing RPC timeouts (this was seen at boot: "CONFIG_FREERTOS_HZ is 100, ESP-Hosted
+# recommended 1000") - and in practice, running the captive portal HTTP server under the default
+# 100Hz tick caused the WiFi RPC link to time out and crash the app ~15s after a client (like a
+# curl request) started hitting the portal.
+CONFIG_FREERTOS_HZ=1000

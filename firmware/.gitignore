@@ -1,0 +1,5 @@
+/.vscode
+/.embuild
+/target
+.uv-python-shim/
+.tools-env/

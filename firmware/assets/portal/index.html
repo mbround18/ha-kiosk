@@ -1,0 +1,141 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>HA Kiosk Setup</title>
+<style>
+body { font-family: sans-serif; max-width: 420px; margin: 2rem auto; padding: 0 1rem; }
+h1 { font-size: 1.3rem; }
+section { margin-bottom: 2rem; padding: 1rem; border: 1px solid #ccc; border-radius: 8px; }
+section.done { border-color: #2a2; background: #f2fff2; }
+label { display: block; margin-top: 0.75rem; font-size: 0.9rem; }
+input, select { width: 100%; padding: 0.5rem; margin-top: 0.25rem; box-sizing: border-box; }
+button { margin-top: 1rem; padding: 0.6rem 1.2rem; }
+.error { color: #c00; margin-top: 0.5rem; }
+.hint { color: #666; font-size: 0.85rem; }
+</style>
+</head>
+<body>
+<h1>HA Kiosk Setup</h1>
+
+<section id="wifi-section">
+  <h2>1. WiFi Network</h2>
+  <div id="wifi-networks"></div>
+  <label>Password<input type="password" id="wifi-password"></label>
+  <button id="wifi-submit">Connect</button>
+  <div class="error" id="wifi-error"></div>
+</section>
+
+<section id="ha-section">
+  <h2>2. Home Assistant</h2>
+  <label>Home Assistant URL
+    <input type="text" id="ha-url" placeholder="http://homeassistant.local:8123">
+  </label>
+  <label>Long-lived access token
+    <input type="password" id="ha-token">
+  </label>
+  <p class="hint">Generate one from your Home Assistant profile page, under
+    "Long-lived access tokens".</p>
+  <button id="ha-submit">Connect</button>
+  <div class="error" id="ha-error"></div>
+</section>
+
+<section id="dashboard-section">
+  <h2>3. Dashboard</h2>
+  <div id="dashboard-list"></div>
+  <div class="error" id="dashboard-error"></div>
+</section>
+
+<script>
+async function refreshStatus() {
+  const status = await (await fetch('/api/status')).json();
+  document.getElementById('wifi-section').className = status.wifi_configured ? 'done' : '';
+  document.getElementById('ha-section').className = status.ha_configured ? 'done' : '';
+  document.getElementById('dashboard-section').className = status.dashboard_selected ? 'done' : '';
+  if (status.wifi_configured) loadNetworksSkip(); else loadNetworks();
+  if (status.ha_configured) loadDashboards();
+}
+
+function loadNetworksSkip() {
+  document.getElementById('wifi-networks').innerHTML = '<p>Connected.</p>';
+}
+
+async function loadNetworks() {
+  const data = await (await fetch('/api/networks')).json();
+  const el = document.getElementById('wifi-networks');
+  el.innerHTML = '';
+  const select = document.createElement('select');
+  select.id = 'wifi-ssid';
+  for (const n of data.networks) {
+    const opt = document.createElement('option');
+    opt.value = n.ssid;
+    opt.textContent = `${n.ssid} (${n.secure ? 'secured' : 'open'}, ${n.rssi} dBm)`;
+    select.appendChild(opt);
+  }
+  el.appendChild(select);
+}
+
+document.getElementById('wifi-submit').onclick = async () => {
+  const ssid = document.getElementById('wifi-ssid').value;
+  const password = document.getElementById('wifi-password').value;
+  const res = await fetch('/api/wifi', {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ ssid, password }),
+  });
+  const data = await res.json();
+  const err = document.getElementById('wifi-error');
+  if (data.status === 'connected') {
+    err.textContent = '';
+    refreshStatus();
+  } else {
+    err.textContent = 'Failed: ' + data.reason;
+  }
+};
+
+document.getElementById('ha-submit').onclick = async () => {
+  const base_url = document.getElementById('ha-url').value;
+  const access_token = document.getElementById('ha-token').value;
+  const res = await fetch('/api/home-assistant', {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ base_url, access_token }),
+  });
+  const data = await res.json();
+  const err = document.getElementById('ha-error');
+  if (data.status === 'connected') {
+    err.textContent = '';
+    refreshStatus();
+  } else {
+    err.textContent = 'Failed: ' + data.reason;
+  }
+};
+
+async function loadDashboards() {
+  const data = await (await fetch('/api/dashboards')).json();
+  const el = document.getElementById('dashboard-list');
+  el.innerHTML = '';
+  if (data.dashboards.length === 0) {
+    el.innerHTML = '<p>No dashboards found yet. Create one in Home Assistant, then reload this page.</p>';
+    return;
+  }
+  for (const d of data.dashboards) {
+    const btn = document.createElement('button');
+    btn.textContent = d.title;
+    btn.onclick = async () => {
+      await fetch('/api/dashboard', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ url_path: d.url_path, title: d.title }),
+      });
+      refreshStatus();
+    };
+    el.appendChild(btn);
+  }
+}
+
+refreshStatus();
+</script>
+</body>
+</html>
