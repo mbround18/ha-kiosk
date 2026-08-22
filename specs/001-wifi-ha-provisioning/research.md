@@ -88,3 +88,27 @@ check link-up state on the onboard Ethernet PHY at boot before deciding whether 
 **Alternatives considered**: Always requiring WiFi setup even when Ethernet is wired — rejected,
 unnecessary friction the spec's assumption already ruled out (open to revisiting if the user
 disagrees, per the assumption's own caveat).
+
+## Amendment (2026-08-22): setup-page frontend is React + Vite + TypeScript + shadcn/ui
+
+**Decision**: T017/T021/T026's "setup-page UI" tasks are implemented as a proper Vite + React +
+TypeScript app (`firmware/portal-ui`, using shadcn/ui components and Tailwind CSS, package
+manager `pnpm`), not hand-written static HTML/JS. The built output (fixed, unhashed filenames -
+`vite.config.ts` `rollupOptions.output`) is embedded into the firmware binary via
+`include_bytes!` at compile time, and `firmware/build.rs` runs `pnpm install`/`pnpm build`
+automatically so a plain `cargo build` stays reproducible (Constitution Principle VI) without a
+manual frontend-build step.
+
+**Rationale**: the user requested this stack directly for a nicer, more maintainable setup UI,
+including a new splash screen (shown before the WiFi/HA/dashboard steps) with two QR codes: one
+encoding a `WIFI:` URI for this device's own AP (so a phone can join by scanning instead of
+manually finding/selecting the SSID), and one encoding this page's own URL (so a second
+device, or the same phone if the OS's captive-portal auto-popup didn't trigger, can open it by
+scanning). Backed by a new `GET /api/portal-info` endpoint (contracts/captive-portal-api.md)
+returning the AP's SSID and IP so neither is hardcoded client-side.
+
+**Alternatives considered**: keeping the original hand-written HTML/JS (`firmware/assets/portal/`,
+now removed) — rejected per explicit user request; a pure static QR-only splash with no JS
+framework — rejected since the rest of the setup flow (WiFi/HA/dashboard steps) benefits from the
+same component-based rewrite for consistency, and the flash-size cost (~520KB) is negligible
+against this board's 16MB flash.

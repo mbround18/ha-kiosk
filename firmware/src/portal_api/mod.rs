@@ -2,6 +2,13 @@ use serde::{Deserialize, Serialize};
 
 use crate::storage::SetupState;
 
+/// contracts/captive-portal-api.md: GET /api/portal-info response
+#[derive(Serialize)]
+pub struct PortalInfoResponse {
+    pub ssid: String,
+    pub ip: String,
+}
+
 /// contracts/captive-portal-api.md: GET /api/networks response entry
 #[derive(Serialize)]
 pub struct NetworkInfo {

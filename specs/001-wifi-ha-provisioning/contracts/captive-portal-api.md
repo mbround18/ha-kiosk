@@ -20,8 +20,23 @@ makes resolvable for literally any hostname.
 
 ## `GET /`
 
-Setup page (single-page app or server-rendered — implementation detail for the plan/tasks phase).
-Must reflect current `SetupState` so already-configured steps show as such rather than blank.
+Setup page: a single-page React app (`firmware/portal-ui`, Vite + TypeScript + shadcn/ui),
+built ahead of time and embedded into the firmware binary as static assets (see
+`firmware/build.rs` and `firmware/src/net/ap_portal.rs`'s `EMBEDDED_ASSETS` table — no
+filesystem partition involved). Must reflect current `SetupState` so already-configured steps
+show as such rather than blank. The app's first screen is a splash view showing two QR codes —
+one to join this device's own WiFi AP directly, one to open this same URL — before proceeding
+into the WiFi/HA/dashboard steps; see `GET /api/portal-info`.
+
+## `GET /api/portal-info`
+
+Returns this device's own AP network name and IP, so the splash screen can render QR codes for
+them (a `WIFI:` URI for the SSID, a plain URL for the IP) without hardcoding either.
+
+**Response 200**:
+```json
+{ "ssid": "HA-Kiosk-1BFD", "ip": "192.168.71.1" }
+```
 
 ## `GET /api/networks`
 

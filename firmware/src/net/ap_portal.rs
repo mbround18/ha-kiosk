@@ -66,6 +66,7 @@ pub fn run(
     wait_for_ap_netif_up(&wifi)?;
     log::info!("Captive portal AP up, DHCP serving on {AP_IP}");
 
+    let ssid_for_server = ssid.clone();
     let storage = Storage::new(nvs)?;
     // FR-006 only requires tearing down the AP once a *fresh* join completes during this very
     // session - not just because WiFi already happens to be configured, which is exactly the
@@ -76,7 +77,7 @@ pub fn run(
     let state = Arc::new(Mutex::new(SharedState { wifi, storage }));
 
     start_dns_hijack();
-    let _server = start_http_server(state.clone())?;
+    let _server = start_http_server(state.clone(), ssid_for_server)?;
 
     loop {
         std::thread::sleep(std::time::Duration::from_secs(1));
@@ -177,17 +178,86 @@ fn build_dns_response(query: &[u8], ap_ip: [u8; 4]) -> Option<Vec<u8>> {
     Some(response)
 }
 
-fn start_http_server(state: Arc<Mutex<SharedState>>) -> anyhow::Result<EspHttpServer<'static>> {
+/// The captive portal's frontend (firmware/portal-ui: Vite + React + TypeScript + shadcn/ui) is
+/// built ahead of time (`pnpm build` in that directory) and its output embedded directly into
+/// the firmware binary - there's no filesystem/SPIFFS partition serving this, just static byte
+/// arrays. `portal-ui/vite.config.ts` configures fixed, unhashed output filenames specifically
+/// so this table doesn't need regenerating on every frontend change.
+struct EmbeddedAsset {
+    path: &'static str,
+    content_type: &'static str,
+    bytes: &'static [u8],
+}
+
+const EMBEDDED_ASSETS: &[EmbeddedAsset] = &[
+    EmbeddedAsset {
+        path: "/",
+        content_type: "text/html",
+        bytes: include_bytes!("../../portal-ui/dist/index.html"),
+    },
+    EmbeddedAsset {
+        path: "/assets/app.js",
+        content_type: "text/javascript",
+        bytes: include_bytes!("../../portal-ui/dist/assets/app.js"),
+    },
+    EmbeddedAsset {
+        path: "/assets/app.css",
+        content_type: "text/css",
+        bytes: include_bytes!("../../portal-ui/dist/assets/app.css"),
+    },
+    EmbeddedAsset {
+        path: "/assets/app.woff2",
+        content_type: "font/woff2",
+        bytes: include_bytes!("../../portal-ui/dist/assets/app.woff2"),
+    },
+    EmbeddedAsset {
+        path: "/assets/app2.woff2",
+        content_type: "font/woff2",
+        bytes: include_bytes!("../../portal-ui/dist/assets/app2.woff2"),
+    },
+    EmbeddedAsset {
+        path: "/assets/app3.woff2",
+        content_type: "font/woff2",
+        bytes: include_bytes!("../../portal-ui/dist/assets/app3.woff2"),
+    },
+    EmbeddedAsset {
+        path: "/assets/app4.woff2",
+        content_type: "font/woff2",
+        bytes: include_bytes!("../../portal-ui/dist/assets/app4.woff2"),
+    },
+    EmbeddedAsset {
+        path: "/assets/app5.woff2",
+        content_type: "font/woff2",
+        bytes: include_bytes!("../../portal-ui/dist/assets/app5.woff2"),
+    },
+    EmbeddedAsset {
+        path: "/favicon.svg",
+        content_type: "image/svg+xml",
+        bytes: include_bytes!("../../portal-ui/dist/favicon.svg"),
+    },
+    EmbeddedAsset {
+        path: "/icons.svg",
+        content_type: "image/svg+xml",
+        bytes: include_bytes!("../../portal-ui/dist/icons.svg"),
+    },
+];
+
+fn start_http_server(
+    state: Arc<Mutex<SharedState>>,
+    ssid: String,
+) -> anyhow::Result<EspHttpServer<'static>> {
     let mut server = EspHttpServer::new(&HttpServerConfig {
         stack_size: 10240,
         ..Default::default()
     })?;
 
-    server.fn_handler("/", Method::Get, |req| -> anyhow::Result<()> {
-        req.into_ok_response()?
-            .write_all(include_bytes!("../../assets/portal/index.html"))?;
-        Ok(())
-    })?;
+    for asset in EMBEDDED_ASSETS {
+        server.fn_handler(asset.path, Method::Get, move |req| -> anyhow::Result<()> {
+            req.into_response(200, None, &[("Content-Type", asset.content_type)])?
+                .write_all(asset.bytes)?;
+            Ok(())
+        })?;
+    }
 
     // Captive-portal OS-detection endpoints (contracts/captive-portal-api.md): respond with
     // something other than the OS's expected "this network is fine" answer, so the OS pops its
@@ -196,6 +266,20 @@ fn start_http_server(state: Arc<Mutex<SharedState>>) -> anyhow::Result<EspHttpSe
         server.fn_handler(path, Method::Get, |req| -> anyhow::Result<()> {
             req.into_response(302, Some("Found"), &[("Location", "/")])?;
             Ok(())
+        })?;
+    }
+
+    {
+        let ssid = ssid.clone();
+        server.fn_handler("/api/portal-info", Method::Get, move |req| -> anyhow::Result<()> {
+            write_json(
+                req,
+                200,
+                &PortalInfoResponse {
+                    ssid: ssid.clone(),
+                    ip: AP_IP.to_string(),
+                },
+            )
         })?;
     }
 
