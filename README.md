@@ -1,5 +1,7 @@
 # ha-kiosk
 
+![ha-kiosk running on an ESP32-P4-Function-EV-Board, showing weather/humidity averages above a two-column grid of room toggles](docs/assets/example.jpg)
+
 A dedicated Home Assistant wall panel for the Espressif ESP32-P4-Function-EV-Board — no browser,
 no tablet, no third-party app. Point it at your Home Assistant instance and get a always-on,
 touch-controlled light switch for every room in your home.
