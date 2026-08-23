@@ -10,7 +10,7 @@ pub struct PortalInfoResponse {
 }
 
 /// contracts/captive-portal-api.md: GET /api/networks response entry
-#[derive(Serialize)]
+#[derive(Serialize, Clone)]
 pub struct NetworkInfo {
     pub ssid: String,
     pub rssi: i8,
@@ -98,6 +98,13 @@ pub struct HaConnectResponse {
     pub instance_name: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reason: Option<&'static str>,
+    /// Set only for `status: "awaiting_confirmation"` - the certificate's issuer, for the portal
+    /// UI to show alongside "check the kiosk screen" (see `ha::tofu::CapturedCert`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub issuer: Option<String>,
+    /// Set only for `status: "awaiting_confirmation"` - the certificate's SHA-256 fingerprint.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub fingerprint: Option<String>,
 }
 
 impl HaConnectResponse {
@@ -106,6 +113,8 @@ impl HaConnectResponse {
             status: "connected",
             instance_name: Some(instance_name),
             reason: None,
+            issuer: None,
+            fingerprint: None,
         }
     }
 
@@ -114,6 +123,44 @@ impl HaConnectResponse {
             status: "failed",
             instance_name: None,
             reason: Some(reason.as_str()),
+            issuer: None,
+            fingerprint: None,
+        }
+    }
+
+    /// Every automatic HTTPS trust path failed - a human needs to approve the certificate
+    /// `ha::tofu::fetch_peer_cert` captured via the device's own on-screen tap-to-trust prompt
+    /// before the connection can proceed. The portal UI should show `issuer`/`fingerprint` and
+    /// poll `GET /api/home-assistant/status` until it resolves.
+    pub fn awaiting_confirmation(issuer: String, fingerprint: String) -> Self {
+        Self {
+            status: "awaiting_confirmation",
+            instance_name: None,
+            reason: None,
+            issuer: Some(issuer),
+            fingerprint: Some(fingerprint),
+        }
+    }
+
+    /// The on-screen prompt was tapped "Cancel".
+    pub fn rejected() -> Self {
+        Self {
+            status: "rejected",
+            instance_name: None,
+            reason: None,
+            issuer: None,
+            fingerprint: None,
+        }
+    }
+
+    /// Nobody tapped the on-screen prompt before its timeout elapsed.
+    pub fn timed_out() -> Self {
+        Self {
+            status: "timed_out",
+            instance_name: None,
+            reason: None,
+            issuer: None,
+            fingerprint: None,
         }
     }
 }

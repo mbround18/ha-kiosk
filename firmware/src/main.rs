@@ -1,3 +1,6 @@
+mod audio;
+mod debug_log;
+mod display;
 mod ha;
 mod net;
 mod portal_api;
@@ -36,6 +39,8 @@ fn reprovision_button_held() -> bool {
 fn main() -> anyhow::Result<()> {
     esp_idf_svc::sys::link_patches();
     esp_idf_svc::log::EspLogger::initialize_default();
+    debug_log::install();
+    debug_log::event("app_main: boot");
 
     let peripherals = Peripherals::take()?;
     let sys_loop = EspSystemEventLoop::take()?;
@@ -46,27 +51,35 @@ fn main() -> anyhow::Result<()> {
         log::info!("BOOT button held at startup - forcing captive portal setup mode");
     }
 
-    // data-model.md boot decision: enter the AP/captive-portal only when there's no working
-    // network path yet. Ethernet link detection is stubbed (net::ethernet) pending board-
-    // specific PHY verification, so today this always evaluates the WiFi-not-configured branch;
-    // once Ethernet is wired up, an already-up link will skip straight past this.
-    let wifi_already_configured = {
+    // data-model.md boot decision: skip setup only once WiFi/Ethernet AND Home Assistant AND a
+    // dashboard are all configured - checking wifi_configured alone (as this used to) left a
+    // device with WiFi but no HA/dashboard yet stranded with no way to reach that step at all,
+    // since `net::ap_portal::run` used to tear its whole HTTP server down the instant WiFi
+    // joined. Ethernet link detection is stubbed (net::ethernet) pending board-specific PHY
+    // verification, so today this always evaluates the network-not-up branch of that OR; once
+    // Ethernet is wired up, an already-up link still can't skip HA/dashboard setup on its own.
+    let setup_state = {
         let storage = storage::Storage::new(nvs.clone())?;
-        storage.setup_state().wifi_configured
+        storage.setup_state()
     };
+    let network_up = setup_state.wifi_configured || net::ethernet::link_up();
+    let setup_complete =
+        network_up && setup_state.ha_configured && setup_state.dashboard_selected;
 
-    if !force_setup && (net::ethernet::link_up() || wifi_already_configured) {
-        log::info!("Network already configured or Ethernet is up - normal operation (display/UI not yet implemented)");
-        loop {
-            std::thread::sleep(std::time::Duration::from_secs(5));
-        }
+    if !force_setup && setup_complete {
+        log::info!("Network up and setup complete - starting kiosk mode");
+        net::kiosk::run(peripherals, sys_loop, nvs)?;
+        unreachable!("net::kiosk::run only returns on error, which is propagated by `?` above");
     }
 
-    log::info!("No working network - starting captive portal setup");
+    log::info!("Setup incomplete - starting captive portal / setup flow");
     net::ap_portal::run(peripherals, sys_loop, nvs)?;
 
-    log::info!("Captive portal setup finished - continuing to normal operation");
-    loop {
-        std::thread::sleep(std::time::Duration::from_secs(5));
-    }
+    // `net::kiosk::run` needs its own fresh `Peripherals`/`EspSystemEventLoop`/
+    // `EspDefaultNvsPartition` (singletons that can't cleanly be re-taken from the ones
+    // `ap_portal::run` just consumed), so rather than threading ownership through a hand-off,
+    // just reboot into the fast path above - a standard, robust way to switch an embedded
+    // device between fundamentally different runtime modes.
+    log::info!("Captive portal setup finished - rebooting into kiosk mode");
+    unsafe { esp_idf_svc::sys::esp_restart() };
 }

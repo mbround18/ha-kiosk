@@ -1,2 +1,8 @@
 /target
 .claude/settings.local.json
+.env
+/certs
+
+# Vendor board documentation bundle (schematics, datasheets, manuals) - not ours to redistribute.
+# Kept locally for reference only; never commit.
+/source

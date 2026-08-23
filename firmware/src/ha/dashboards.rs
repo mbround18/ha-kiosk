@@ -26,9 +26,15 @@ struct HaDashboardEntry {
 pub fn list_dashboards(base_url: &str, access_token: &str) -> anyhow::Result<Vec<DashboardInfo>> {
     let ws_url = to_ws_url(base_url);
 
+    // Without this, esp-tls refuses to open any wss:// connection at all ("No server
+    // verification option set in esp_tls_cfg_t structure") - this client never had the same
+    // certificate handling `ha::rest::try_connect` does, so every dashboard-listing attempt
+    // failed outright regardless of the HA connection step having already succeeded moments
+    // earlier over plain HTTPS.
     let config = EspWebSocketClientConfig {
         task_stack: 8192,
         buffer_size: 4096,
+        crt_bundle_attach: ws_url.starts_with("wss://").then_some(esp_idf_svc::sys::esp_crt_bundle_attach),
         ..Default::default()
     };
 

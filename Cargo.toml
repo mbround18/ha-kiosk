@@ -1,7 +1,11 @@
-[package]
-name = "ch340-dev"
-version = "0.1.0"
-edition = "2024"
-
-[dependencies]
-serialport = "4.9.0"
+[workspace]
+resolver = "2"
+members = ["flasher"]
+# `firmware` is deliberately NOT a workspace member: it's an ESP-IDF (embedded, riscv32imafc-esp-
+# espidf target) crate pinned to its own toolchain via firmware/rust-toolchain.toml, with a heavy
+# native (cmake/esp-idf) build process and its own Cargo.lock. Folding it into this workspace
+# would force a single unified lockfile/toolchain across a host-target CLI tool and an embedded
+# target, risking exactly the kind of dependency-resolution/toolchain drift that took a lot of
+# effort to get working in the first place. Build it independently (`cd firmware && cargo build
+# --release`, or via `flasher flash`, which just shells out to that same command).
+exclude = ["firmware"]

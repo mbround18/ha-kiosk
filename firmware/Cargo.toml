@@ -30,6 +30,8 @@ embassy-time = { version = "0.5", features = ["generic-queue-8"] }
 embedded-svc = "0.29"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+embedded-graphics = "0.8"
+qrcode = { version = "0.14", default-features = false }
 
 [build-dependencies]
 embuild = "0.33"
@@ -42,6 +44,16 @@ embuild = "0.33"
 extra_components = [
     { remote_component = { name = "espressif/esp_wifi_remote", version = ">=0.10,<2.0" } },
     { remote_component = { name = "espressif/esp_hosted", version = "~2" } },
+    # BSP for this exact board. NOT the generic espressif/esp32_p4_function_ev_board(_noglib)
+    # registry component - this hardware is actually a third-party board (GUITION
+    # JC1060P470C_I_W_Y) that reuses the Espressif BSP's structure/API with its own patched pin
+    # assignments and a JD9165 panel driver (not EK79007). The generic registry component
+    # reports success with the wrong panel init sequence and the wrong backlight GPIO (26 vs
+    # this board's actual 23) - it "worked" (no crash) but never actually lit the screen. This
+    # vendored copy comes from the manufacturer's own official demo project
+    # (source/1-Demo/Demo_IDF/.../JC1060P470C_I_W_Y_New_Panel/common_components). See
+    # research.md's display bring-up decision.
+    { component_dirs = ["vendor/esp32_p4_function_ev_board"], bindings_header = "bsp_bindings.h" },
     # Needed for esp-idf-svc's ws::client (used for the one-shot Home Assistant
     # lovelace/dashboards/list WebSocket call). Not built into ESP-IDF core.
     { remote_component = { name = "espressif/esp_websocket_client", version = "*" } },

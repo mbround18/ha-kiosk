@@ -9,6 +9,7 @@ pub struct WifiCredentials {
 }
 
 /// data-model.md: HomeAssistantConnection
+#[derive(Clone)]
 pub struct HomeAssistantConnection {
     pub base_url: String,
     pub access_token: String,
@@ -130,6 +131,22 @@ impl Storage {
     pub fn clear_wifi_credentials(&mut self) -> anyhow::Result<()> {
         self.nvs.remove("wifi_ssid")?;
         self.nvs.remove("wifi_pass")?;
+        Ok(())
+    }
+
+    /// A PEM-encoded CA trust anchor captured at runtime via TOFU (`ha::tofu`) for HA instances
+    /// behind a private CA - see `ha::rest::verify_connection`. Persisted so the capture dance
+    /// only ever has to happen once per HA instance (after a human approves it via the
+    /// on-screen tap-to-trust prompt), not on every boot.
+    pub fn get_pinned_ca(&self) -> Option<Vec<u8>> {
+        let len = self.nvs.blob_len("ha_pinned_ca").ok()??;
+        let mut buf = vec![0u8; len];
+        self.nvs.get_blob("ha_pinned_ca", &mut buf).ok()??;
+        Some(buf)
+    }
+
+    pub fn set_pinned_ca(&mut self, pem: &[u8]) -> anyhow::Result<()> {
+        self.nvs.set_blob("ha_pinned_ca", pem)?;
         Ok(())
     }
 }

@@ -1,0 +1,13 @@
+services:
+  syslog-ng:
+    image: balabit/syslog-ng:latest
+    ports:
+      - "514:514/udp"
+      - "601:601/tcp"
+    volumes:
+      - ./etc:/etc/syslog-ng
+      - syslog-ng-logs:/var/log
+    restart: unless-stopped
+
+volumes:
+  syslog-ng-logs:

@@ -24,3 +24,34 @@ CONFIG_ESP32P4_REV_MIN_100=y
 # 100Hz tick caused the WiFi RPC link to time out and crash the app ~15s after a client (like a
 # curl request) started hitting the portal.
 CONFIG_FREERTOS_HZ=1000
+
+# The espressif/esp32_p4_function_ev_board_noglib BSP pulls in esp_codec_dev (audio codec
+# control) for board completeness, which still uses the legacy I2C driver, while the BSP's own
+# touch/display I2C usage uses the new i2c_master driver. ESP-IDF's generational conflict guard
+# aborts on boot as soon as both are ever installed, even though this app never uses audio at
+# all. See github.com/espressif/esp-idf issues #16146/#16071 for the same class of BSP/codec
+# mismatch. Safe to skip here since nothing in this firmware actually shares an I2C bus/device
+# across the two driver generations.
+CONFIG_I2C_SKIP_LEGACY_CONFLICT_CHECK=y
+
+# The display's 1024x600 RGB565 framebuffer (~1.2MB) needs PSRAM - this board has 32MB, but
+# nothing needed it before the display work, so PSRAM was never enabled. Values match the
+# manufacturer's own working JC1060P470C_I_W_Y demo (source/1-Demo/Demo_IDF/ESP-IDF_5.5.4/
+# JC1060P470C_I_W_Y_New_Panel/lvgl_demo_v9/sdkconfig.defaults) for this exact chip/PSRAM
+# combination. An earlier attempt at 200M faulted the PSRAM controller and was dropped to 120M,
+# but that was before CONFIG_ESP32P4_REV_MIN_100 above was in place - the manufacturer's demo
+# runs 200M successfully with that same rev fix, and 120M was suspected of starving the DPI
+# panel's continuous PSRAM framebuffer reads (symptom: stretched image + green flashing).
+CONFIG_SPIRAM=y
+CONFIG_SPIRAM_MODE_HEX=y
+CONFIG_SPIRAM_SPEED_200M=y
+CONFIG_SPIRAM_XIP_FROM_PSRAM=y
+CONFIG_CACHE_L2_CACHE_256KB=y
+CONFIG_CACHE_L2_CACHE_LINE_128B=y
+
+# QR code generation (firmware/src/display/splash.rs, the `qrcode` crate's mask-pattern
+# penalty-score computation specifically) is a synchronous, CPU-bound one-shot at boot that
+# doesn't yield - it ran long enough to starve the idle task and trip the default 5s task
+# watchdog. This is a one-time startup cost, not a recurring hot path, so a longer timeout here
+# is low-risk.
+CONFIG_ESP_TASK_WDT_TIMEOUT_S=30

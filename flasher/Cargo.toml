@@ -1,0 +1,18 @@
+[package]
+name = "flasher"
+version = "0.1.0"
+edition = "2024"
+description = "Host-side CLI: builds + flashes the ha-kiosk firmware, and can auto-provision a freshly flashed device from .env so you can skip the on-device setup flow entirely."
+
+[[bin]]
+name = "ha-kiosk-flasher"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+dotenvy = "0.15"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+serialport = "4.9.0"
+ureq = { version = "2", features = ["json"] }

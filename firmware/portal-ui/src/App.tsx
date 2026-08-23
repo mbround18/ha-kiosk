@@ -4,7 +4,7 @@ import { WifiStep } from '@/components/WifiStep'
 import { HaStep } from '@/components/HaStep'
 import { DashboardStep } from '@/components/DashboardStep'
 import { Badge } from '@/components/ui/badge'
-import { api, type PortalInfo, type StatusResponse } from '@/lib/api'
+import { api, type StatusResponse } from '@/lib/api'
 
 type Screen = 'loading' | 'splash' | 'wifi' | 'ha' | 'dashboard' | 'done'
 
@@ -36,17 +36,9 @@ function StepIndicator({ current }: { current: Screen }) {
 
 export default function App() {
   const [screen, setScreen] = useState<Screen>('loading')
-  const [portalInfo, setPortalInfo] = useState<PortalInfo | null>(null)
   const [instanceName, setInstanceName] = useState<string | null>(null)
 
   useEffect(() => {
-    api
-      .portalInfo()
-      .then(setPortalInfo)
-      .catch(() => {
-        /* QR codes just won't render; the rest of the flow still works */
-      })
-
     api
       .status()
       .then((status) => {
@@ -65,7 +57,7 @@ export default function App() {
   }
 
   if (screen === 'splash') {
-    return <SplashScreen portalInfo={portalInfo} onContinue={() => setScreen('wifi')} />
+    return <SplashScreen onContinue={() => setScreen('wifi')} />
   }
 
   if (screen === 'done') {
