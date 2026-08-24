@@ -5,7 +5,7 @@ use embedded_graphics::prelude::*;
 use embedded_graphics::primitives::{Circle, CornerRadii, PrimitiveStyle, Rectangle, RoundedRectangle};
 use embedded_graphics::text::{Alignment, Text};
 
-use firmware_core::home::{format_climate_line, format_weather_line, Climate, Room, Weather};
+use firmware_core::home::{format_climate_line, format_weather_line, Climate, Clock, Room, Weather};
 use firmware_core::layout::{fit_text_scale, pick_layout, COLUMNS};
 
 use super::{Display, HEIGHT, WIDTH};
@@ -50,6 +50,11 @@ fn theme_off_track_muted() -> Rgb565 {
 }
 fn theme_unavailable() -> Rgb565 {
     rgb(0x37, 0x41, 0x51) // gray-700 - dim against the dark background, reads as disabled
+}
+fn theme_stale_warning() -> Rgb565 {
+    rgb(0xEF, 0x44, 0x44) // red-500 - not in the palette; deliberately distinct from --accent
+                          // (used for the "Rooms" header normally) so a stale header is visibly
+                          // different at a glance, not just a re-tinted version of the usual look
 }
 
 const HEADER_HEIGHT: i32 = 150;
@@ -105,35 +110,26 @@ pub fn show_rooms(
     rooms: &[Room],
     weather: Option<&Weather>,
     climate: Option<&Climate>,
+    stale: bool,
 ) -> anyhow::Result<KioskButtons> {
     display.fill(theme_background());
 
-    // Content here comes straight from live HA data (weather condition names, climate mode
-    // breakdowns) whose length isn't under our control - a fixed text scale would eventually run
-    // some combination off the edge of the screen, so both lines pick the largest scale (down to
-    // 1) that actually fits the available width instead.
+    draw_weather_line(display, weather);
+    // `stale` means HA hasn't been reachable for several refresh cycles in a row - everything
+    // below (room on/off, weather, climate) is still whatever was last successfully fetched, not
+    // necessarily true right now. Rather than hide that (which risks a room silently reading
+    // "on" for hours while actually off - the bug this was added for), the header itself flags
+    // it: the room grid and weather stay on screen as the best information available, just
+    // visibly marked as possibly outdated instead of presented as current.
     let header_max_width = (WIDTH as i32) - 2 * OUTER_MARGIN;
-    if let Some(line) = weather.map(format_weather_line).filter(|l| !l.is_empty()) {
-        let scale = fit_text_scale(&line, 2, header_max_width);
-        draw_text(display, &line, Point::new((WIDTH / 2) as i32, 40), theme_text(), Alignment::Center, scale);
-    }
-    draw_text(display, "Rooms", Point::new((WIDTH / 2) as i32, 115), theme_accent(), Alignment::Center, 2);
-
-    if let Some(line) = climate
-        .map(|c| format_climate_line(c, weather.map(|w| w.unit.as_str()).unwrap_or("°F")))
-        .filter(|l| !l.is_empty())
-    {
-        let footer_max_width = (WIDTH as i32) - OUTER_MARGIN;
-        let scale = fit_text_scale(&line, 1, footer_max_width);
-        draw_text(
-            display,
-            &line,
-            Point::new((WIDTH as i32) - OUTER_MARGIN, (HEIGHT as i32) - FOOTER_HEIGHT / 2 + 7),
-            theme_text(),
-            Alignment::Right,
-            scale,
-        );
-    }
+    let (header_text, header_color) = if stale {
+        ("Rooms (may be outdated)", theme_stale_warning())
+    } else {
+        ("Rooms", theme_accent())
+    };
+    let header_scale = if stale { fit_text_scale(header_text, 2, header_max_width) } else { 2 };
+    draw_text(display, header_text, Point::new((WIDTH / 2) as i32, 115), header_color, Alignment::Center, header_scale);
+    draw_climate_line(display, weather, climate);
 
     let available_height = (HEIGHT as i32) - HEADER_HEIGHT - FOOTER_HEIGHT;
     let layout = pick_layout(rooms.len(), available_height);
@@ -185,6 +181,66 @@ pub fn show_rooms(
     display.flush()?;
 
     Ok(KioskButtons(buttons))
+}
+
+/// Shared by `show_rooms` and `show_screensaver` - both put the same weather summary in the same
+/// spot at the top of the screen. Content here comes straight from live HA data (weather
+/// condition names) whose length isn't under our control - a fixed text scale would eventually
+/// run some combination off the edge of the screen, so this picks the largest scale (down to 1)
+/// that actually fits the available width instead.
+fn draw_weather_line(display: &mut Display, weather: Option<&Weather>) {
+    let header_max_width = (WIDTH as i32) - 2 * OUTER_MARGIN;
+    if let Some(line) = weather.map(format_weather_line).filter(|l| !l.is_empty()) {
+        let scale = fit_text_scale(&line, 2, header_max_width);
+        draw_text(display, &line, Point::new((WIDTH / 2) as i32, 40), theme_text(), Alignment::Center, scale);
+    }
+}
+
+/// Shared by `show_rooms` and `show_screensaver` - both put the same compact climate/AC summary
+/// in the same bottom-right corner. Same reactive-width rationale as `draw_weather_line`.
+fn draw_climate_line(display: &mut Display, weather: Option<&Weather>, climate: Option<&Climate>) {
+    if let Some(line) = climate
+        .map(|c| format_climate_line(c, weather.map(|w| w.unit.as_str()).unwrap_or("°F")))
+        .filter(|l| !l.is_empty())
+    {
+        let footer_max_width = (WIDTH as i32) - OUTER_MARGIN;
+        let scale = fit_text_scale(&line, 1, footer_max_width);
+        draw_text(
+            display,
+            &line,
+            Point::new((WIDTH as i32) - OUTER_MARGIN, (HEIGHT as i32) - FOOTER_HEIGHT / 2 + 7),
+            theme_text(),
+            Alignment::Right,
+            scale,
+        );
+    }
+}
+
+/// The idle screensaver: shown by `net::kiosk` in place of `show_rooms` once the screen has
+/// dimmed from inactivity (see `IDLE_DIM_TIMEOUT`). Keeps the same weather/AC summary in the
+/// same header/footer spots as the room screen - only the middle, where the room grid normally
+/// is, changes to a large centered clock. The room grid itself is deliberately left off: nothing
+/// on this screen is tappable while dimmed (`net::kiosk` treats the first tap as purely a
+/// wake-up, not a room toggle), so showing toggles here would invite a tap that looks like it
+/// should do something but can't.
+pub fn show_screensaver(display: &mut Display, clock: Option<&Clock>, weather: Option<&Weather>, climate: Option<&Climate>) -> anyhow::Result<()> {
+    display.fill(theme_background());
+
+    draw_weather_line(display, weather);
+    draw_climate_line(display, weather, climate);
+
+    let center_y = HEADER_HEIGHT + ((HEIGHT as i32) - HEADER_HEIGHT - FOOTER_HEIGHT) / 2;
+    let max_width = (WIDTH as i32) - 2 * OUTER_MARGIN;
+    if let Some(clock) = clock {
+        let time_scale = fit_text_scale(&clock.time, 6, max_width);
+        draw_text(display, &clock.time, Point::new((WIDTH / 2) as i32, center_y - 20), theme_text(), Alignment::Center, time_scale);
+
+        let date_scale = fit_text_scale(&clock.date, 2, max_width);
+        draw_text(display, &clock.date, Point::new((WIDTH / 2) as i32, center_y + 60), theme_accent(), Alignment::Center, date_scale);
+    }
+
+    display.flush()?;
+    Ok(())
 }
 
 /// Redraws one room's toggle in its new (optimistic) position right after a tap, `muted` (a

@@ -44,6 +44,19 @@ pub struct Climate {
     pub mode_counts: Vec<(String, u32)>,
 }
 
+/// Current time/date, pre-formatted server-side by Home Assistant's `now()` (see
+/// `ha::rooms::fetch_clock`) rather than computed from the device's own clock - the device only
+/// has SNTP (UTC, no timezone), while HA already knows the instance's configured local timezone,
+/// so asking it directly avoids needing to plumb a timezone onto the device at all. Shown by
+/// `display::kiosk::show_screensaver` in place of the room grid once the screen has idled long
+/// enough to dim.
+pub struct Clock {
+    /// e.g. "03:45 PM"
+    pub time: String,
+    /// e.g. "Monday, August 24"
+    pub date: String,
+}
+
 /// e.g. "72F Sunny  |  Avg Home 70F  |  Avg Humidity 45%" - each piece (current temp/condition,
 /// average temp, average humidity) is only included if HA actually provided it (no weather
 /// entity, or no matching sensors, are both unremarkable configurations rather than errors worth

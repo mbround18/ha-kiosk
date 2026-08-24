@@ -6,7 +6,7 @@ use esp_idf_svc::sys::*;
 mod kiosk;
 mod splash;
 mod trust_confirm;
-pub use kiosk::{show_rooms, update_toggle, KioskButtons};
+pub use kiosk::{show_rooms, show_screensaver, update_toggle, KioskButtons};
 pub use splash::{show_finish_setup_splash, show_setup_splash};
 pub use trust_confirm::{show_trust_confirm, TrustButtons};
 

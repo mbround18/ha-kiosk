@@ -17,7 +17,7 @@ use esp_idf_svc::nvs::EspDefaultNvsPartition;
 use esp_idf_svc::sntp::{EspSntp, SyncStatus};
 use esp_idf_svc::wifi::{BlockingWifi, ClientConfiguration, Configuration, EspWifi};
 
-use crate::ha::rooms::{self, Climate, Room, Weather};
+use crate::ha::rooms::{self, Climate, Clock, Room, Weather};
 use crate::storage::Storage;
 
 /// Poll cadence for touch input while the room list is on screen. Now that HA calls run on a
@@ -35,6 +35,11 @@ const ACTION_COOLDOWN: Duration = Duration::from_secs(2);
 const IDLE_DIM_TIMEOUT: Duration = Duration::from_secs(60);
 const DIM_BRIGHTNESS_PERCENT: u8 = 15;
 const FULL_BRIGHTNESS_PERCENT: u8 = 100;
+/// Consecutive failed `fetch_dashboard_data` cycles (see below) before the on-screen room/
+/// weather/climate data is flagged as possibly stale. >1 so a single transient blip (HA
+/// restarting, a dropped packet) doesn't flash the warning; a real outage lasting multiple
+/// cycles is what this is meant to catch.
+const STALE_AFTER_FAILURES: u32 = 3;
 
 pub fn run(
     peripherals: Peripherals,
@@ -90,8 +95,13 @@ pub fn run(
     let mut rooms: Vec<Room> = Vec::new();
     let mut weather: Option<Weather> = None;
     let mut climate: Option<Climate> = None;
+    let mut clock: Option<Clock> = None;
     let mut buttons: Option<crate::display::KioskButtons> = None;
-    let mut last_room_refresh = std::time::Instant::now() - ROOM_REFRESH_INTERVAL;
+    // Whether the screensaver (see `display::show_screensaver`) reflects the current
+    // `clock`/`weather`/`climate` values - `None` (unlike `buttons`, which is dropped rather than
+    // just marked stale) since there's no per-tap hit-testing state to preserve here, just a
+    // "does the screen need a redraw" flag.
+    let mut screensaver_drawn = false;
     // Per-area "don't act on taps again until" deadlines - see `ACTION_COOLDOWN`. This is the
     // actual anti-flood guard: a child mashing one room's buttons gets every tap past the first
     // silently dropped (not queued - dropped) until the cooldown clears, so HA only ever sees
@@ -99,64 +109,208 @@ pub fn run(
     let mut cooldowns: HashMap<String, Instant> = HashMap::new();
     let mut last_activity = Instant::now();
     let mut dimmed = false;
+    // How many `fetch_dashboard_data` cycles in a row have failed - see `STALE_AFTER_FAILURES`.
+    // Reset to 0 on any success; drives the "may be outdated" header warning in
+    // `display::show_rooms` once it crosses the threshold, since a failed fetch otherwise leaves
+    // `rooms`/`weather`/`climate` (and therefore the screen) frozen on whatever was last fetched
+    // with no visible sign that's no longer current.
+    let mut consecutive_failures: u32 = 0;
+    let mut stale = false;
 
-    // `set_room_lights` is a fresh WebSocket connect+auth+call every time (1-2s+), and used to
-    // run inline on this loop - meaning touch polling, dimming, and every other room's UI simply
-    // froze for that whole stretch. A single persistent worker thread (not one thread per tap -
-    // that would let a kid mashing several different rooms pile up unbounded concurrent HA
-    // connections) takes it off this loop entirely, processing one action at a time while this
-    // loop stays responsive to touch every `TICK` regardless of what HA is doing.
-    let (action_tx, action_rx) = mpsc::channel::<(String, bool)>();
-    let (result_tx, result_rx) = mpsc::channel::<(String, bool, anyhow::Result<()>)>();
+    // Both room refreshes and light toggles used to open a fresh WebSocket connect+auth every
+    // time (1-2s+, sometimes 10+), which used to run inline on this loop and freeze touch
+    // polling for the whole stretch. Fixed in two parts: this all happens on a single persistent
+    // worker thread (not one thread per tap - that would let a kid mashing several rooms pile up
+    // unbounded concurrent HA connections) so this loop stays responsive to touch every `TICK`
+    // regardless of what HA is doing; and the worker keeps ONE `HaWsSession` open for the
+    // kiosk's entire runtime instead of reconnecting every `ROOM_REFRESH_INTERVAL` - reconnecting
+    // that often turned out to be the actual cause of a real heap leak (confirmed via on-device
+    // serial logs: internal heap dropping every single refresh cycle, exhausting this board's
+    // ~220KB internal heap in roughly 2 hours - the original "state goes stale after a few
+    // hours" bug). The session is only ever dropped and replaced when a call on it actually
+    // fails, so a reconnect only happens as often as the connection genuinely needs one.
+    enum HaRequest {
+        Refresh,
+        SetLights(String, bool),
+    }
+    enum HaResponse {
+        Dashboard(anyhow::Result<(Vec<Room>, Option<Weather>, Option<Climate>, Option<Clock>)>),
+        LightsResult(String, bool, anyhow::Result<()>),
+    }
+    let (request_tx, request_rx) = mpsc::channel::<HaRequest>();
+    let (response_tx, response_rx) = mpsc::channel::<HaResponse>();
     {
         let worker_ha = ha.clone();
         std::thread::Builder::new()
             .stack_size(16 * 1024)
             .spawn(move || {
-                for (area_id, turn_on) in action_rx {
-                    let result =
-                        rooms::set_room_lights(&worker_ha.base_url, &worker_ha.access_token, &area_id, turn_on);
-                    if result_tx.send((area_id, turn_on, result)).is_err() {
+                let mut session: Option<rooms::HaWsSession> = None;
+                loop {
+                    // Waiting up to `ROOM_REFRESH_INTERVAL` for an explicit request (a tap's
+                    // light toggle, or a kicked refresh after one fails - see below) doubles as
+                    // this thread's own periodic-refresh timer: a timeout with nothing queued
+                    // just means it's time to refresh anyway.
+                    let request = match request_rx.recv_timeout(ROOM_REFRESH_INTERVAL) {
+                        Ok(request) => request,
+                        Err(mpsc::RecvTimeoutError::Timeout) => HaRequest::Refresh,
+                        Err(mpsc::RecvTimeoutError::Disconnected) => break, // kiosk::run's loop is gone
+                    };
+
+                    if session.is_none() {
+                        session = match rooms::HaWsSession::connect(&worker_ha.base_url, &worker_ha.access_token) {
+                            Ok(s) => Some(s),
+                            Err(e) => {
+                                crate::debug_log::event(format!("kiosk: HA reconnect failed: {e:?}"));
+                                None
+                            }
+                        };
+                    }
+
+                    let sent = match request {
+                        HaRequest::Refresh => {
+                            // Logged on every attempt (success or failure) specifically to make
+                            // a slow heap leak visible over a long run - see `ha::rooms::
+                            // HaWsSession`'s doc comment for the leak this whole persistent-
+                            // connection design was written to fix. Internal (non-PSRAM) heap is
+                            // tracked separately from the total - this board's ~29MB of free
+                            // PSRAM would hide a leak for a very long time, but internal SRAM
+                            // (where driver buffers, e.g. this WS client's TLS context, actually
+                            // live) is far smaller and would show it fast.
+                            let free_heap = unsafe { esp_idf_svc::sys::esp_get_free_heap_size() };
+                            let free_internal_heap = unsafe {
+                                esp_idf_svc::sys::heap_caps_get_free_size(esp_idf_svc::sys::MALLOC_CAP_INTERNAL)
+                            };
+                            let result = match session.as_mut() {
+                                Some(s) => rooms::fetch_dashboard_data(s),
+                                None => Err(anyhow::anyhow!("not connected to Home Assistant")),
+                            };
+                            if result.is_err() {
+                                session = None; // this connection is suspect - reconnect fresh next time
+                            }
+                            match &result {
+                                Ok((fetched_rooms, ..)) => crate::debug_log::event(format!(
+                                    "kiosk: fetched {} room(s): {:?} (free heap: {free_heap} total, {free_internal_heap} internal)",
+                                    fetched_rooms.len(),
+                                    fetched_rooms.iter().map(|r| &r.name).collect::<Vec<_>>()
+                                )),
+                                Err(e) => crate::debug_log::event(format!(
+                                    "kiosk: failed to fetch dashboard data: {e:?} (free heap: {free_heap} total, {free_internal_heap} internal)"
+                                )),
+                            }
+                            response_tx.send(HaResponse::Dashboard(result))
+                        }
+                        HaRequest::SetLights(area_id, turn_on) => {
+                            let result = match session.as_mut() {
+                                Some(s) => rooms::set_room_lights(s, &area_id, turn_on),
+                                None => Err(anyhow::anyhow!("not connected to Home Assistant")),
+                            };
+                            if result.is_err() {
+                                session = None;
+                            }
+                            response_tx.send(HaResponse::LightsResult(area_id, turn_on, result))
+                        }
+                    };
+                    if sent.is_err() {
                         break; // kiosk::run's loop is gone
                     }
                 }
             })?;
     }
+    let _ = request_tx.send(HaRequest::Refresh); // don't wait a full `ROOM_REFRESH_INTERVAL` for the first fetch
 
     loop {
         std::thread::sleep(TICK);
         let now = Instant::now();
 
-        if last_room_refresh.elapsed() >= ROOM_REFRESH_INTERVAL {
-            // Logged on every refresh cycle (every `ROOM_REFRESH_INTERVAL`, so this doesn't
-            // flood the ring buffer) specifically to make a slow heap leak visible over a long
-            // run - each refresh opens and tears down a fresh WebSocket/TLS connection, and the
-            // device's own logs show that teardown isn't always clean ("Connection terminated
-            // while waiting for clean TCP close"), which is exactly the shape of thing that can
-            // leak a little memory per cycle without erroring outright. Internal (non-PSRAM)
-            // heap is tracked separately from the total - this board's ~29MB of free PSRAM would
-            // hide a leak for a very long time, but internal SRAM (where driver buffers, e.g.
-            // this WS client's TLS context, actually live) is far smaller and would show it fast.
-            let free_heap = unsafe { esp_idf_svc::sys::esp_get_free_heap_size() };
-            let free_internal_heap =
-                unsafe { esp_idf_svc::sys::heap_caps_get_free_size(esp_idf_svc::sys::MALLOC_CAP_INTERNAL) };
-            match rooms::fetch_dashboard_data(&ha.base_url, &ha.access_token) {
-                Ok((fetched_rooms, fetched_weather, fetched_climate)) => {
-                    crate::debug_log::event(format!(
-                        "kiosk: fetched {} room(s): {:?} (free heap: {free_heap} total, {free_internal_heap} internal)",
-                        fetched_rooms.len(),
-                        fetched_rooms.iter().map(|r| &r.name).collect::<Vec<_>>()
-                    ));
+        // Non-blocking: the actual HA work (and its logging) happens on the worker thread
+        // spawned above, so this never stalls touch polling waiting on the network. Both a
+        // finished refresh and a finished light toggle arrive on the same channel now (one
+        // persistent worker handles both), so this one drain loop replaces what used to be two
+        // separate ones.
+        while let Ok(response) = response_rx.try_recv() {
+            match response {
+                HaResponse::Dashboard(Ok((fetched_rooms, fetched_weather, fetched_climate, fetched_clock))) => {
                     rooms = fetched_rooms;
                     weather = fetched_weather;
                     climate = fetched_climate;
+                    clock = fetched_clock;
+                    consecutive_failures = 0;
+                    stale = false;
                     buttons = None; // force a redraw with the fresh room list/weather/climate
+                    screensaver_drawn = false; // and the screensaver, if that's what's showing
                 }
-                Err(e) => crate::debug_log::event(format!(
-                    "kiosk: failed to fetch dashboard data: {e:?} (free heap: {free_heap} total, {free_internal_heap} internal)"
-                )),
+                HaResponse::Dashboard(Err(_)) => {
+                    consecutive_failures += 1;
+                    if !stale && firmware_core::screen::is_stale(consecutive_failures, STALE_AFTER_FAILURES) {
+                        // The room/weather/climate data on screen isn't going to change (it stays
+                        // whatever was last successfully fetched), but the header needs to flip
+                        // to the warning state - force a redraw just for that.
+                        stale = true;
+                        buttons = None;
+                    }
+                }
+                HaResponse::LightsResult(area_id, turn_on, Ok(())) => {
+                    // The call really did succeed, so the optimistic flip was correct - confirm
+                    // it (un-mute) now rather than waiting out the rest of the cooldown.
+                    if let Some(rect) = buttons.as_ref().and_then(|b| b.rect_for(&area_id)) {
+                        let is_on = rooms.iter().find(|r| r.area_id == area_id).map(|r| r.is_on).unwrap_or(turn_on);
+                        crate::display::update_toggle(&mut display, rect, is_on, false);
+                    }
+                }
+                HaResponse::LightsResult(area_id, turn_on, Err(e)) => {
+                    // Previously this reverted `is_on` to `!turn_on` - a guess. That guess can be
+                    // wrong: a timed-out/failed WebSocket round trip (which is exactly the shape
+                    // of thing seen under memory pressure on long runs) doesn't necessarily mean
+                    // the `call_service` never reached HA - it may have gone through just fine
+                    // and only our client's confirmation was lost, which would make "confidently
+                    // revert to the opposite" actively misleading (this is the state-mismatch bug
+                    // reported after an hour-long run: HA said on, device said off). Instead of
+                    // guessing, ask HA directly: force an immediate refresh instead. The toggle
+                    // is left in its current muted state (not reverted, not confirmed) until
+                    // that refresh redraws everything with ground truth.
+                    log::warn!("kiosk: set_room_lights({area_id}, {turn_on}) failed: {e} - forcing an immediate refresh instead of guessing the outcome");
+                    let _ = request_tx.send(HaRequest::Refresh);
+                }
             }
-            last_room_refresh = std::time::Instant::now();
+        }
+
+        // Polled up front (rather than after drawing, as before) so a wake-up tap is known before
+        // deciding what to draw this tick - the screensaver's `continue` below has to happen
+        // before any room-screen drawing/hit-testing runs. The actual dim/wake decision is a pure
+        // function (`firmware_core::screen::decide_tick`, unit tested there) - this just acts on
+        // it (backlight, forced redraws) since those need the real `Display`.
+        let tap = display.poll_tap();
+        if tap.is_some() {
+            last_activity = now;
+        }
+        let decision = firmware_core::screen::decide_tick(dimmed, tap.is_some(), now, last_activity, IDLE_DIM_TIMEOUT);
+        let woke_this_tick = decision.woke_this_tick;
+        if decision.dimmed != dimmed {
+            dimmed = decision.dimmed;
+            if dimmed {
+                if let Err(e) = display.set_brightness(DIM_BRIGHTNESS_PERCENT) {
+                    log::warn!("kiosk: failed to dim brightness: {e}");
+                }
+                screensaver_drawn = false; // force the initial screensaver draw
+            } else {
+                if let Err(e) = display.set_brightness(FULL_BRIGHTNESS_PERCENT) {
+                    log::warn!("kiosk: failed to restore brightness: {e}");
+                }
+                buttons = None; // force a fresh room-grid draw now that we're back
+            }
+        }
+
+        if dimmed {
+            // Nothing else this tick: no room hit-testing (there's no room grid on screen to hit
+            // test against), no worker-result toggle drawing (nothing queued while idle this
+            // long - see `screensaver_drawn`'s doc comment). Just keep the screensaver current.
+            if !screensaver_drawn {
+                match crate::display::show_screensaver(&mut display, clock.as_ref(), weather.as_ref(), climate.as_ref()) {
+                    Ok(()) => screensaver_drawn = true,
+                    Err(e) => log::warn!("kiosk: failed to draw screensaver: {e}"),
+                }
+            }
+            continue;
         }
 
         // Once a cooldown expires, force a full redraw so that room's toggle visibly goes from
@@ -177,57 +331,14 @@ pub fn run(
         }
 
         if buttons.is_none() {
-            match crate::display::show_rooms(&mut display, &rooms, weather.as_ref(), climate.as_ref()) {
+            match crate::display::show_rooms(&mut display, &rooms, weather.as_ref(), climate.as_ref(), stale) {
                 Ok(b) => buttons = Some(b),
                 Err(e) => log::warn!("kiosk: failed to draw room list: {e}"),
             }
         }
 
-        // Pick up any HA call(s) the worker thread has finished since last tick. Doing this
-        // separately from the cooldown timer (rather than just waiting `ACTION_COOLDOWN` out)
-        // means a toggle confirms as soon as the real round trip completes - usually well under
-        // 2s - instead of always waiting the full cooldown before looking "settled".
-        while let Ok((area_id, turn_on, result)) = result_rx.try_recv() {
-            match result {
-                Ok(()) => {
-                    // The call really did succeed, so the optimistic flip was correct - confirm
-                    // it (un-mute) now rather than waiting out the rest of the cooldown.
-                    if let Some(rect) = buttons.as_ref().and_then(|b| b.rect_for(&area_id)) {
-                        let is_on = rooms.iter().find(|r| r.area_id == area_id).map(|r| r.is_on).unwrap_or(turn_on);
-                        crate::display::update_toggle(&mut display, rect, is_on, false);
-                    }
-                }
-                Err(e) => {
-                    // Previously this reverted `is_on` to `!turn_on` - a guess. That guess can be
-                    // wrong: a timed-out/failed WebSocket round trip (which is exactly the shape
-                    // of thing seen under memory pressure on long runs) doesn't necessarily mean
-                    // the `call_service` never reached HA - it may have gone through just fine
-                    // and only our client's confirmation was lost, which would make "confidently
-                    // revert to the opposite" actively misleading (this is the state-mismatch bug
-                    // reported after an hour-long run: HA said on, device said off). Instead of
-                    // guessing, ask HA directly: force the next refresh to happen on the very
-                    // next tick. The toggle is left in its current muted state (not reverted, not
-                    // confirmed) until that refresh redraws everything with ground truth.
-                    log::warn!("kiosk: set_room_lights({area_id}, {turn_on}) failed: {e} - forcing an immediate refresh instead of guessing the outcome");
-                    last_room_refresh = Instant::now() - ROOM_REFRESH_INTERVAL;
-                }
-            }
-        }
-
-        let tap = display.poll_tap();
-        if tap.is_some() {
-            last_activity = now;
-            if dimmed {
-                if let Err(e) = display.set_brightness(FULL_BRIGHTNESS_PERCENT) {
-                    log::warn!("kiosk: failed to restore brightness: {e}");
-                }
-                dimmed = false;
-            }
-        } else if !dimmed && now.duration_since(last_activity) >= IDLE_DIM_TIMEOUT {
-            if let Err(e) = display.set_brightness(DIM_BRIGHTNESS_PERCENT) {
-                log::warn!("kiosk: failed to dim brightness: {e}");
-            }
-            dimmed = true;
+        if woke_this_tick {
+            continue; // this tap just woke the screen - don't also act on it as a room toggle
         }
 
         let Some(tap) = tap else {
@@ -259,8 +370,8 @@ pub fn run(
         if let Some(rect) = buttons.as_ref().and_then(|b| b.rect_for(&area_id)) {
             crate::display::update_toggle(&mut display, rect, turn_on, true);
         }
-        if action_tx.send((area_id.clone(), turn_on)).is_err() {
-            log::warn!("kiosk: HA action worker thread is gone, dropping tap on {area_id}");
+        if request_tx.send(HaRequest::SetLights(area_id.clone(), turn_on)).is_err() {
+            log::warn!("kiosk: HA worker thread is gone, dropping tap on {area_id}");
         }
 
         cooldowns.insert(area_id.clone(), Instant::now() + ACTION_COOLDOWN);

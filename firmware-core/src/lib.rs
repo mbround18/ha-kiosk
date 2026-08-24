@@ -11,3 +11,4 @@
 pub mod home;
 pub mod layout;
 pub mod portal_api;
+pub mod screen;

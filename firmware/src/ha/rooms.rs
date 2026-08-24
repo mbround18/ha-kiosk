@@ -21,22 +21,23 @@ use serde_json::Value;
 /// `Room`/`Weather`/`Climate` are plain data with no ESP-IDF dependency, so they're defined in
 /// `firmware_core::home` (a host-testable crate) instead of here - this module is just the
 /// WebSocket fetching logic that populates them.
-pub use firmware_core::home::{Climate, Room, Weather};
+pub use firmware_core::home::{Climate, Clock, Room, Weather};
 
-/// A single request/response HA WebSocket session - connects, authenticates, and lets the
-/// caller make any number of `call` requests before dropping (which closes the connection).
-/// Home Assistant assigns meaning to the numeric "id" field itself (matching each response to
-/// its request), not to any persistent session state, so a fresh connection per kiosk
-/// refresh/action is simple and robust rather than trying to keep one long-lived connection
-/// alive across the kiosk's whole runtime.
-struct HaWsSession {
+/// A request/response HA WebSocket session - connects, authenticates, and lets the caller make
+/// any number of `call` requests. Home Assistant assigns meaning to the numeric "id" field
+/// itself (matching each response to its request), not to any per-connection state, which is
+/// exactly what makes it safe for `net::kiosk` to keep one of these open and reuse it for the
+/// kiosk's whole runtime (see that module's doc comment) rather than reconnecting every refresh
+/// cycle - reconnecting that often turned out to be the actual cause of a real heap leak
+/// (confirmed via on-device serial logs measuring internal heap loss on every refresh cycle).
+pub(crate) struct HaWsSession {
     client: EspWebSocketClient<'static>,
     received: Arc<Mutex<Vec<String>>>,
     next_id: u32,
 }
 
 impl HaWsSession {
-    fn connect(base_url: &str, access_token: &str) -> anyhow::Result<Self> {
+    pub(crate) fn connect(base_url: &str, access_token: &str) -> anyhow::Result<Self> {
         let ws_url = to_ws_url(base_url);
         let config = EspWebSocketClientConfig {
             task_stack: 8192,
@@ -103,8 +104,19 @@ impl HaWsSession {
     /// `{"type": "result", ...}` ack that the subscription was accepted, followed by a separate
     /// `{"type": "event", "event": {"result": ...}}` carrying the actual rendered value (HA
     /// treats every `render_template` as a live subscription that would keep re-sending on
-    /// change - fine here since the whole connection is dropped right after this session
-    /// finishes, cleaning it up without needing an explicit unsubscribe).
+    /// change).
+    ///
+    /// Explicitly unsubscribes once the one value this is actually used for has arrived, rather
+    /// than just letting every one of these subscriptions (one per room, plus weather/climate/
+    /// clock - several per session) ride until the whole connection drops at the end of
+    /// `fetch_dashboard_data`. Leaving them open was the cause of a real heap leak, confirmed via
+    /// on-device serial logs: every session's `esp_websocket_client_close` was logging
+    /// "Connection terminated while waiting for clean TCP close" / "unexpected data readable on
+    /// socket" - HA pushing an unread update on one of these still-live subscriptions right as
+    /// the connection was closing, which the underlying C client doesn't handle cleanly. Measured
+    /// on hardware: internal heap dropping ~750 bytes on almost every 15s refresh cycle, which
+    /// exhausts this board's ~220KB internal heap in roughly 2 hours - the "state goes stale
+    /// after a few hours" bug this was written to fix.
     fn render_template(&mut self, template: &str) -> anyhow::Result<Value> {
         let id = self.next_id;
         self.next_id += 1;
@@ -127,7 +139,22 @@ impl HaWsSession {
         let event = self.wait_for(Duration::from_secs(10), move |msg| {
             msg["id"].as_u64() == Some(id as u64) && msg["type"] == "event"
         })?;
-        Ok(event["event"]["result"].clone())
+        let result = event["event"]["result"].clone();
+
+        // Fire-and-forget: HA acks this too, but that ack isn't worth an extra round trip since
+        // there's nothing left to do with this subscription either way - the goal is just to
+        // stop it from pushing anything more once this session closes.
+        let unsubscribe_id = self.next_id;
+        self.next_id += 1;
+        if let Err(e) = self.send_raw(&serde_json::json!({
+            "id": unsubscribe_id,
+            "type": "unsubscribe_events",
+            "subscription": id,
+        })) {
+            log::warn!("render_template: failed to unsubscribe from subscription {id}: {e}");
+        }
+
+        Ok(result)
     }
 
     fn send_raw(&mut self, payload: &Value) -> anyhow::Result<()> {
@@ -136,24 +163,41 @@ impl HaWsSession {
         Ok(())
     }
 
+    /// Scans `received` for the first message matching `matches`, blocking (polling every 50ms)
+    /// until one arrives or `timeout` elapses.
+    ///
+    /// Every match found - and everything that arrived before it, matched or not - is drained
+    /// out of `received` before returning. That's safe because calls are made and awaited
+    /// strictly in increasing id order (nothing is ever awaited "out of turn"), so anything
+    /// sitting before a just-matched message can only be: an earlier call's response we already
+    /// consumed and moved past, or a fire-and-forget message (e.g. `render_template`'s
+    /// `unsubscribe_events`) nobody was ever going to wait for. Either way it's dead weight.
+    /// Without this, `received` would simply grow for as long as the session stays open - fine
+    /// for the old one-connection-per-fetch design where a session only lived a few seconds, but
+    /// unbounded (and, worse, rescanned from index 0 on every single call, so also
+    /// O(session-lifetime) work per call) on a session meant to live for the kiosk's entire
+    /// runtime.
     fn wait_for(
         &mut self,
         timeout: Duration,
         matches: impl Fn(&Value) -> bool,
     ) -> anyhow::Result<Value> {
         let deadline = std::time::Instant::now() + timeout;
-        let mut checked = 0usize;
         loop {
             {
-                let buf = self.received.lock().unwrap();
-                while checked < buf.len() {
-                    let raw = &buf[checked];
-                    checked += 1;
+                let mut buf = self.received.lock().unwrap();
+                let mut found_at = None;
+                for (i, raw) in buf.iter().enumerate() {
                     if let Ok(parsed) = serde_json::from_str::<Value>(raw) {
                         if matches(&parsed) {
-                            return Ok(parsed);
+                            found_at = Some((i, parsed));
+                            break;
                         }
                     }
+                }
+                if let Some((i, parsed)) = found_at {
+                    buf.drain(0..=i);
+                    return Ok(parsed);
                 }
             }
             if std::time::Instant::now() > deadline {
@@ -164,30 +208,38 @@ impl HaWsSession {
     }
 }
 
-/// Rooms and weather in a single WebSocket session (rather than two separate connects) since the
-/// kiosk's main loop refreshes both together on the same cadence. Weather is best-effort: a
-/// failure there (e.g. no `weather.*` entity configured) shouldn't take down the room list.
-pub fn fetch_dashboard_data(
-    base_url: &str,
-    access_token: &str,
-) -> anyhow::Result<(Vec<Room>, Option<Weather>, Option<Climate>)> {
-    let mut session = HaWsSession::connect(base_url, access_token)?;
-    let rooms = fetch_rooms(&mut session)?;
-    let weather = match fetch_weather(&mut session) {
+/// Rooms, weather, climate, and clock over an already-connected session (see `net::kiosk`'s
+/// persistent `HaWsSession`) rather than opening a fresh connection - the kiosk's main loop
+/// refreshes all of these together on the same cadence. Weather/climate/clock are best-effort: a
+/// failure in any one of them (e.g. no `weather.*` entity configured) shouldn't take down the
+/// room list, which is the one part of this that actually has to succeed for the screen to show
+/// anything meaningful.
+pub(crate) fn fetch_dashboard_data(
+    session: &mut HaWsSession,
+) -> anyhow::Result<(Vec<Room>, Option<Weather>, Option<Climate>, Option<Clock>)> {
+    let rooms = fetch_rooms(session)?;
+    let weather = match fetch_weather(session) {
         Ok(w) => Some(w),
         Err(e) => {
             crate::debug_log::event(format!("fetch_dashboard_data: weather fetch failed: {e:?}"));
             None
         }
     };
-    let climate = match fetch_climate(&mut session) {
+    let climate = match fetch_climate(session) {
         Ok(c) => Some(c),
         Err(e) => {
             crate::debug_log::event(format!("fetch_dashboard_data: climate fetch failed: {e:?}"));
             None
         }
     };
-    Ok((rooms, weather, climate))
+    let clock = match fetch_clock(session) {
+        Ok(c) => Some(c),
+        Err(e) => {
+            crate::debug_log::event(format!("fetch_dashboard_data: clock fetch failed: {e:?}"));
+            None
+        }
+    };
+    Ok((rooms, weather, climate, clock))
 }
 
 /// Every room with at least one `light.*` entity, sorted by name.
@@ -360,16 +412,37 @@ fn fetch_climate(session: &mut HaWsSession) -> anyhow::Result<Climate> {
     })
 }
 
+/// Current local time/date, pre-formatted by HA's own `now()` (which already resolves to the
+/// instance's configured timezone) rather than the device's own clock - see `Clock`'s doc
+/// comment for why. `%I`/`%d` (not `%-I`/`%-d`) deliberately keep the leading zero: the
+/// no-leading-zero glibc extensions aren't guaranteed to exist on every platform HA might be
+/// running on (e.g. a musl-based container), and a screensaver clock reading "08:45 AM" instead
+/// of "8:45 AM" isn't worth risking a template error over.
+fn fetch_clock(session: &mut HaWsSession) -> anyhow::Result<Clock> {
+    const TEMPLATE: &str = r#"
+{{ {
+    'time': now().strftime('%I:%M %p'),
+    'date': now().strftime('%A, %B %d')
+} | tojson }}
+"#;
+
+    let result = session.render_template(TEMPLATE)?;
+    let parsed: Value = match result {
+        Value::String(s) => serde_json::from_str(&s)?,
+        other => other,
+    };
+
+    Ok(Clock {
+        time: parsed["time"].as_str().unwrap_or("").to_string(),
+        date: parsed["date"].as_str().unwrap_or("").to_string(),
+    })
+}
+
 /// Turns every light in the given area on or off via HA's area-targeted `light.turn_on`/
 /// `light.turn_off` service call - HA resolves the area to its member light entities itself, so
-/// this doesn't need to enumerate them.
-pub fn set_room_lights(
-    base_url: &str,
-    access_token: &str,
-    area_id: &str,
-    on: bool,
-) -> anyhow::Result<()> {
-    let mut session = HaWsSession::connect(base_url, access_token)?;
+/// this doesn't need to enumerate them. Takes an already-connected session for the same reason
+/// as `fetch_dashboard_data` above.
+pub(crate) fn set_room_lights(session: &mut HaWsSession, area_id: &str, on: bool) -> anyhow::Result<()> {
     session.call(
         "call_service",
         serde_json::json!({
