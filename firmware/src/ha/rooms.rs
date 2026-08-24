@@ -43,6 +43,18 @@ pub struct Weather {
     pub avg_home_humidity: Option<f64>,
 }
 
+/// A compact summary of every `climate.*` entity ("AC"/thermostat) in the home - shown in the
+/// bottom-right corner of the kiosk screen. `avg_current_temp` averages their sensed (not
+/// target) temperature the same way `Weather::avg_home_temp` averages plain sensors, since
+/// that's the actual measured room condition; `mode_counts` is how many units are in each HVAC
+/// mode (`off`/`heat`/`cool`/`heat_cool`/`auto`/`dry`/`fan_only`) so a mixed-mode home (one unit
+/// cooling, another off) shows a compact breakdown instead of a single misleading mode.
+pub struct Climate {
+    pub avg_current_temp: Option<f64>,
+    /// `(hvac_mode, count)`, sorted by count descending then mode name for stable output.
+    pub mode_counts: Vec<(String, u32)>,
+}
+
 /// A single request/response HA WebSocket session - connects, authenticates, and lets the
 /// caller make any number of `call` requests before dropping (which closes the connection).
 /// Home Assistant assigns meaning to the numeric "id" field itself (matching each response to
@@ -190,7 +202,7 @@ impl HaWsSession {
 pub fn fetch_dashboard_data(
     base_url: &str,
     access_token: &str,
-) -> anyhow::Result<(Vec<Room>, Option<Weather>)> {
+) -> anyhow::Result<(Vec<Room>, Option<Weather>, Option<Climate>)> {
     let mut session = HaWsSession::connect(base_url, access_token)?;
     let rooms = fetch_rooms(&mut session)?;
     let weather = match fetch_weather(&mut session) {
@@ -200,7 +212,14 @@ pub fn fetch_dashboard_data(
             None
         }
     };
-    Ok((rooms, weather))
+    let climate = match fetch_climate(&mut session) {
+        Ok(c) => Some(c),
+        Err(e) => {
+            crate::debug_log::event(format!("fetch_dashboard_data: climate fetch failed: {e:?}"));
+            None
+        }
+    };
+    Ok((rooms, weather, climate))
 }
 
 /// Every room with at least one `light.*` entity, sorted by name.
@@ -324,6 +343,46 @@ fn fetch_weather(session: &mut HaWsSession) -> anyhow::Result<Weather> {
         unit: parsed["unit"].as_str().unwrap_or("°").to_string(),
         avg_home_temp: parsed["avg_indoor"].as_f64(),
         avg_home_humidity: parsed["avg_humidity"].as_f64(),
+    })
+}
+
+/// Every `climate.*` entity's current HVAC mode (the entity's `state`) and sensed temperature
+/// (`attributes.current_temperature`) - one `render_template` call, same rationale as
+/// `fetch_weather` for keeping this to a single round trip regardless of how many units exist.
+/// Mode counting happens client-side here (rather than in the template) since it's a handful of
+/// short strings at most - simpler than building a Jinja `groupby` expression for it.
+fn fetch_climate(session: &mut HaWsSession) -> anyhow::Result<Climate> {
+    const TEMPLATE: &str = r#"
+{% set climates = states.climate | list %}
+{% set temps = climates
+    | map(attribute='attributes.current_temperature')
+    | select('is_number')
+    | map('float')
+    | list %}
+{{ {
+    'avg_temp': (temps | average) if temps | length > 0 else none,
+    'modes': climates | map(attribute='state') | list
+} | tojson }}
+"#;
+
+    let result = session.render_template(TEMPLATE)?;
+    let parsed: Value = match result {
+        Value::String(s) => serde_json::from_str(&s)?,
+        other => other,
+    };
+
+    let mut counts: std::collections::HashMap<String, u32> = std::collections::HashMap::new();
+    for mode in parsed["modes"].as_array().into_iter().flatten() {
+        if let Some(mode) = mode.as_str() {
+            *counts.entry(mode.to_string()).or_insert(0) += 1;
+        }
+    }
+    let mut mode_counts: Vec<(String, u32)> = counts.into_iter().collect();
+    mode_counts.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+
+    Ok(Climate {
+        avg_current_temp: parsed["avg_temp"].as_f64(),
+        mode_counts,
     })
 }
 

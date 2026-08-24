@@ -6,7 +6,7 @@ use embedded_graphics::primitives::{Circle, CornerRadii, PrimitiveStyle, Rectang
 use embedded_graphics::text::{Alignment, Text};
 
 use super::{Display, HEIGHT, WIDTH};
-use crate::ha::rooms::{Room, Weather};
+use crate::ha::rooms::{Climate, Room, Weather};
 
 /// Converts an 8-bit-per-channel color (as given in a hex palette) to this display's native
 /// 5-6-5 format - `Rgb565::new` itself expects values already in that native bit depth, which is
@@ -48,6 +48,10 @@ fn theme_off_track_muted() -> Rgb565 {
 }
 
 const HEADER_HEIGHT: i32 = 150;
+/// Reserved strip at the bottom of the screen for the compact climate/AC summary (see
+/// `format_climate_line`) - kept to one small-text line since screen space is tight and this is
+/// a secondary, nice-to-have readout compared to the room toggles above it.
+const FOOTER_HEIGHT: i32 = 36;
 const OUTER_MARGIN: i32 = 30;
 const COLUMN_GAP: i32 = 40;
 const COLUMNS: i32 = 2;
@@ -131,6 +135,7 @@ pub fn show_rooms(
     display: &mut Display,
     rooms: &[Room],
     weather: Option<&Weather>,
+    climate: Option<&Climate>,
 ) -> anyhow::Result<KioskButtons> {
     display.fill(theme_background());
 
@@ -139,7 +144,21 @@ pub fn show_rooms(
     }
     draw_text(display, "Rooms", Point::new((WIDTH / 2) as i32, 115), theme_accent(), Alignment::Center, 2);
 
-    let available_height = (HEIGHT as i32) - HEADER_HEIGHT;
+    if let Some(line) = climate
+        .map(|c| format_climate_line(c, weather.map(|w| w.unit.as_str()).unwrap_or("°F")))
+        .filter(|l| !l.is_empty())
+    {
+        draw_text(
+            display,
+            &line,
+            Point::new((WIDTH as i32) - OUTER_MARGIN, (HEIGHT as i32) - FOOTER_HEIGHT / 2 + 7),
+            theme_text(),
+            Alignment::Right,
+            1,
+        );
+    }
+
+    let available_height = (HEIGHT as i32) - HEADER_HEIGHT - FOOTER_HEIGHT;
     let layout = pick_layout(rooms.len(), available_height);
 
     let column_width = (WIDTH as i32 - 2 * OUTER_MARGIN - (COLUMNS - 1) * COLUMN_GAP) / COLUMNS;
@@ -207,6 +226,46 @@ fn format_weather_line(w: &Weather) -> String {
     }
 
     parts.into_iter().filter(|p| !p.is_empty()).collect::<Vec<_>>().join("  |  ")
+}
+
+/// e.g. "AC 74F  |  2xCool 1xOff" - compact by design (bottom-right corner, one line, small
+/// text): a count prefix (`2x`) only appears for a mode with more than one unit in it, so a
+/// single-AC home just reads e.g. "AC 74F  |  Cool" instead of "1xCool".
+fn format_climate_line(c: &Climate, unit_letter: &str) -> String {
+    let mut parts = Vec::new();
+    if let Some(t) = c.avg_current_temp {
+        parts.push(format!("AC {:.0}{unit_letter}", t));
+    }
+    if !c.mode_counts.is_empty() {
+        let modes: Vec<String> = c
+            .mode_counts
+            .iter()
+            .map(|(mode, count)| {
+                let label = climate_mode_label(mode);
+                if *count > 1 {
+                    format!("{count}x{label}")
+                } else {
+                    label.to_string()
+                }
+            })
+            .collect();
+        parts.push(modes.join(" "));
+    }
+    parts.join("  |  ")
+}
+
+/// Short display label for an HA `climate.*` entity's `hvac_mode` state - kept to one word,
+/// since this whole line has to fit in one small corner of the screen.
+fn climate_mode_label(hvac_mode: &str) -> &str {
+    match hvac_mode {
+        "off" => "Off",
+        "heat" => "Heat",
+        "cool" => "Cool",
+        "heat_cool" | "auto" => "Auto",
+        "dry" => "Dry",
+        "fan_only" => "Fan",
+        _ => "?",
+    }
 }
 
 /// Redraws one room's toggle in its new (optimistic) position right after a tap, `muted` (a

@@ -17,7 +17,7 @@ use esp_idf_svc::nvs::EspDefaultNvsPartition;
 use esp_idf_svc::sntp::{EspSntp, SyncStatus};
 use esp_idf_svc::wifi::{BlockingWifi, ClientConfiguration, Configuration, EspWifi};
 
-use crate::ha::rooms::{self, Room, Weather};
+use crate::ha::rooms::{self, Climate, Room, Weather};
 use crate::storage::Storage;
 
 /// Poll cadence for touch input while the room list is on screen. Now that HA calls run on a
@@ -89,6 +89,7 @@ pub fn run(
 
     let mut rooms: Vec<Room> = Vec::new();
     let mut weather: Option<Weather> = None;
+    let mut climate: Option<Climate> = None;
     let mut buttons: Option<crate::display::KioskButtons> = None;
     let mut last_room_refresh = std::time::Instant::now() - ROOM_REFRESH_INTERVAL;
     // Per-area "don't act on taps again until" deadlines - see `ACTION_COOLDOWN`. This is the
@@ -128,7 +129,7 @@ pub fn run(
 
         if last_room_refresh.elapsed() >= ROOM_REFRESH_INTERVAL {
             match rooms::fetch_dashboard_data(&ha.base_url, &ha.access_token) {
-                Ok((fetched_rooms, fetched_weather)) => {
+                Ok((fetched_rooms, fetched_weather, fetched_climate)) => {
                     crate::debug_log::event(format!(
                         "kiosk: fetched {} room(s): {:?}",
                         fetched_rooms.len(),
@@ -136,7 +137,8 @@ pub fn run(
                     ));
                     rooms = fetched_rooms;
                     weather = fetched_weather;
-                    buttons = None; // force a redraw with the fresh room list/weather
+                    climate = fetched_climate;
+                    buttons = None; // force a redraw with the fresh room list/weather/climate
                 }
                 Err(e) => crate::debug_log::event(format!("kiosk: failed to fetch dashboard data: {e:?}")),
             }
@@ -161,7 +163,7 @@ pub fn run(
         }
 
         if buttons.is_none() {
-            match crate::display::show_rooms(&mut display, &rooms, weather.as_ref()) {
+            match crate::display::show_rooms(&mut display, &rooms, weather.as_ref(), climate.as_ref()) {
                 Ok(b) => buttons = Some(b),
                 Err(e) => log::warn!("kiosk: failed to draw room list: {e}"),
             }
