@@ -1,0 +1,46 @@
+name: CI
+
+# Builds/lints/tests this repo's Rust crates on every push to main and every PR, via `paws`
+# (https://github.com/mbround18/paws) - same pipeline whether it runs here or on a contributor's
+# own machine, no separate "how do I reproduce CI locally" story needed.
+#
+# `flasher` (the host-side flash/provision CLI) is deliberately NOT its own CI job here: it needs
+# `libudev-dev` to compile at all (via the `serialport` crate), which paws's plain `rust:1-bookworm`
+# pipeline doesn't provide - see the root Cargo.toml's `members` ordering comment for why this
+# also matters to the `firmware` job below. Flasher stays covered by `cargo check --workspace`
+# passing locally (a real requirement for anyone actually using it to flash a device) rather than
+# an automated gate for now.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  firmware-core:
+    name: firmware-core (host tests)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: mbround18/paws/actions/paws-up@main
+      - name: paws ci --toolchain rust
+        working-directory: firmware-core
+        run: paws ci --toolchain rust
+
+  firmware:
+    name: firmware (ESP32-P4 build)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: mbround18/paws/actions/paws-up@main
+      # Builds the real esp-idf-svc/embuild target (fmt -> clippy -> build) against paws's
+      # dedicated esp32 builder image, plus - via its host-testable-sibling auto-detection -
+      # re-runs firmware-core's own test suite in that same pipeline, since `firmware-core` is
+      # the first non-ESP32 member of the root workspace it walks up to (see root Cargo.toml).
+      - name: paws ci --toolchain esp32
+        working-directory: firmware
+        run: paws ci --toolchain esp32

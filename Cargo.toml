@@ -1,6 +1,12 @@
 [workspace]
 resolver = "2"
-members = ["flasher", "firmware-core"]
+# `firmware-core` listed before `flasher` deliberately: `paws ci --toolchain esp32` (see
+# .github/workflows/ci.yaml) auto-detects a "host-testable sibling" crate by picking the first
+# workspace member here that isn't the ESP32 target itself, to also run its tests alongside
+# building `firmware/`. `firmware-core` (plain logic, no system deps) is the one that actually
+# needs that coverage; `flasher` needs `libudev-dev` (via the `serialport` crate) to even compile,
+# which paws's plain builder images don't provide, so it must never be the one auto-picked.
+members = ["firmware-core", "flasher"]
 # `firmware` is deliberately NOT a workspace member: it's an ESP-IDF (embedded, riscv32imafc-esp-
 # espidf target) crate pinned to its own toolchain via firmware/rust-toolchain.toml, with a heavy
 # native (cmake/esp-idf) build process and its own Cargo.lock. Folding it into this workspace
