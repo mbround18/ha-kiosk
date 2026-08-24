@@ -9,6 +9,11 @@ pub struct Room {
     /// initial position in `display::kiosk`. Kept in sync optimistically by `net::kiosk` after a
     /// tap (rather than waiting for the next refresh) so the toggle visibly flips immediately.
     pub is_on: bool,
+    /// True when every light in this area is currently `unavailable` in HA - e.g. its physical
+    /// power switch was cut, or it lost network. `is_on` is meaningless in that case (HA can't
+    /// confirm any state), so `display::kiosk` grays the toggle out and ignores taps on it
+    /// instead of showing/acting on a potentially-fictional on/off state.
+    pub unavailable: bool,
 }
 
 /// Current weather + a whole-home average indoor temperature, both nice-to-haves shown above

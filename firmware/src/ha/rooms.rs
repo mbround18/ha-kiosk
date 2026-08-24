@@ -210,9 +210,14 @@ fn fetch_rooms(session: &mut HaWsSession) -> anyhow::Result<Vec<Room>> {
         };
         let name = area["name"].as_str().unwrap_or(area_id).to_string();
 
+        // `unavailable` is true when every light in the area is currently `unavailable` in HA
+        // (e.g. its physical power switch was cut, or it lost network) - HA itself is telling us
+        // it can't confirm any state at all for this room, so on/off is meaningless here and
+        // `display::kiosk` grays the toggle out instead of showing a potentially-fictional state.
         let result = session.render_template(&format!(
             "{{% set lights = area_entities('{}') | select('match', '^light\\\\.') | list %}}\
-             {{{{ {{'lights': lights, 'any_on': lights | select('is_state', 'on') | list | length > 0}} | tojson }}}}",
+             {{{{ {{'lights': lights, 'any_on': lights | select('is_state', 'on') | list | length > 0, \
+             'unavailable': lights | reject('is_state', 'unavailable') | list | length == 0}} | tojson }}}}",
             escape_jinja_string(area_id)
         ))?;
         let parsed: Value = match result {
@@ -225,6 +230,7 @@ fn fetch_rooms(session: &mut HaWsSession) -> anyhow::Result<Vec<Room>> {
                 area_id: area_id.to_string(),
                 name,
                 is_on: parsed["any_on"].as_bool().unwrap_or(false),
+                unavailable: parsed["unavailable"].as_bool().unwrap_or(false),
             });
         }
     }

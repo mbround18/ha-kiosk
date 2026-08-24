@@ -48,6 +48,9 @@ fn theme_off_track() -> Rgb565 {
 fn theme_off_track_muted() -> Rgb565 {
     rgb(0xE5, 0xE7, 0xEB) // gray-200
 }
+fn theme_unavailable() -> Rgb565 {
+    rgb(0x37, 0x41, 0x51) // gray-700 - dim against the dark background, reads as disabled
+}
 
 const HEADER_HEIGHT: i32 = 150;
 /// Reserved strip at the bottom of the screen for the compact climate/AC summary (see
@@ -154,12 +157,21 @@ pub fn show_rooms(
             Point::new(x + column_width - layout.toggle_width as i32, row_center - layout.toggle_height as i32 / 2),
             Size::new(layout.toggle_width, layout.toggle_height),
         );
-        draw_toggle(display, toggle_rect, room.is_on, false);
 
-        buttons.push(RoomButton {
-            area_id: room.area_id.clone(),
-            toggle: toggle_rect,
-        });
+        if room.unavailable {
+            // Every light in this area is unavailable (physical power cut, lost network, etc.) -
+            // HA can't confirm any real state here, so this toggle isn't drawn as on/off (that'd
+            // be showing a potentially-fictional state) and isn't registered as tappable at all:
+            // it's simply left out of `buttons`, so a tap here just falls through as if nothing
+            // was there.
+            draw_unavailable_toggle(display, toggle_rect);
+        } else {
+            draw_toggle(display, toggle_rect, room.is_on, false);
+            buttons.push(RoomButton {
+                area_id: room.area_id.clone(),
+                toggle: toggle_rect,
+            });
+        }
     }
 
     display.flush()?;
@@ -202,6 +214,25 @@ fn draw_toggle(display: &mut Display, rect: Rectangle, is_on: bool, muted: bool)
     };
     Circle::new(Point::new(knob_x, knob_y), knob_diameter)
         .into_styled(PrimitiveStyle::with_fill(theme_secondary()))
+        .draw(display)
+        .ok();
+}
+
+/// A flat, dim, disabled-looking track with a centered (not left/right, unlike an on/off toggle)
+/// knob - deliberately doesn't look like a valid on or off position, since neither is true: HA
+/// has told us it can't confirm this room's light state at all right now.
+fn draw_unavailable_toggle(display: &mut Display, rect: Rectangle) {
+    let radius = rect.size.height;
+    RoundedRectangle::new(rect, CornerRadii::new(Size::new(radius, radius)))
+        .into_styled(PrimitiveStyle::with_fill(theme_unavailable()))
+        .draw(display)
+        .ok();
+
+    let knob_diameter = rect.size.height.saturating_sub(8);
+    let knob_x = rect.top_left.x + (rect.size.width as i32 - knob_diameter as i32) / 2;
+    let knob_y = rect.top_left.y + 4;
+    Circle::new(Point::new(knob_x, knob_y), knob_diameter)
+        .into_styled(PrimitiveStyle::with_fill(theme_off_track()))
         .draw(display)
         .ok();
 }

@@ -32,6 +32,11 @@ pub struct Display {
     /// Null if `bsp_touch_new` failed - touch is a nice-to-have for the trust-confirmation
     /// prompt (`display::trust_confirm`), not required for the rest of the display to work.
     touch: esp_lcd_touch_handle_t,
+    /// Whether `esp_lcd_touch_read_data` is currently failing - tracked purely so `poll_tap`
+    /// logs on *transitions* (start/stop failing) rather than every single poll (this is called
+    /// every `TICK`, so unconditional logging would flood the debug ring buffer in seconds). See
+    /// `poll_tap`'s doc comment for why this exists at all.
+    touch_failing: bool,
 }
 
 unsafe impl Send for Display {}
@@ -77,6 +82,7 @@ impl Display {
             panel,
             buffer: vec![0u16; WIDTH * HEIGHT],
             touch,
+            touch_failing: false,
         })
     }
 
@@ -89,13 +95,29 @@ impl Display {
 
     /// Polls the touch controller for a currently-pressed point, in panel pixel coordinates.
     /// Returns `None` if nothing is touched right now, or if touch init failed at startup.
+    ///
+    /// A screen that stops responding to taps after a long uptime, while everything else (the
+    /// HA WebSocket refresh, WiFi) keeps working, has only one place to actually look: this
+    /// function used to return `None` on a read failure with zero logging, indistinguishable
+    /// from "nothing is touched right now" - the GT911 (new `i2c_master` driver) shares its I2C
+    /// bus with the ES8311 audio codec (legacy I2C driver, `CONFIG_I2C_SKIP_LEGACY_CONFLICT_
+    /// CHECK=y` - see `audio.rs`'s doc comment, which flagged this exact risk), so a bus fault
+    /// surfacing only after extended runtime is a real possibility, not just theoretical.
     pub fn poll_tap(&mut self) -> Option<Point> {
         if self.touch.is_null() {
             return None;
         }
         unsafe {
             if esp_lcd_touch_read_data(self.touch) != ESP_OK {
+                if !self.touch_failing {
+                    self.touch_failing = true;
+                    crate::debug_log::event("touch: esp_lcd_touch_read_data started failing - taps will stop registering until this recovers");
+                }
                 return None;
+            }
+            if self.touch_failing {
+                self.touch_failing = false;
+                crate::debug_log::event("touch: esp_lcd_touch_read_data recovered");
             }
             let mut x = [0u16; 1];
             let mut y = [0u16; 1];

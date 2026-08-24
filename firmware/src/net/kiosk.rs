@@ -128,10 +128,22 @@ pub fn run(
         let now = Instant::now();
 
         if last_room_refresh.elapsed() >= ROOM_REFRESH_INTERVAL {
+            // Logged on every refresh cycle (every `ROOM_REFRESH_INTERVAL`, so this doesn't
+            // flood the ring buffer) specifically to make a slow heap leak visible over a long
+            // run - each refresh opens and tears down a fresh WebSocket/TLS connection, and the
+            // device's own logs show that teardown isn't always clean ("Connection terminated
+            // while waiting for clean TCP close"), which is exactly the shape of thing that can
+            // leak a little memory per cycle without erroring outright. Internal (non-PSRAM)
+            // heap is tracked separately from the total - this board's ~29MB of free PSRAM would
+            // hide a leak for a very long time, but internal SRAM (where driver buffers, e.g.
+            // this WS client's TLS context, actually live) is far smaller and would show it fast.
+            let free_heap = unsafe { esp_idf_svc::sys::esp_get_free_heap_size() };
+            let free_internal_heap =
+                unsafe { esp_idf_svc::sys::heap_caps_get_free_size(esp_idf_svc::sys::MALLOC_CAP_INTERNAL) };
             match rooms::fetch_dashboard_data(&ha.base_url, &ha.access_token) {
                 Ok((fetched_rooms, fetched_weather, fetched_climate)) => {
                     crate::debug_log::event(format!(
-                        "kiosk: fetched {} room(s): {:?}",
+                        "kiosk: fetched {} room(s): {:?} (free heap: {free_heap} total, {free_internal_heap} internal)",
                         fetched_rooms.len(),
                         fetched_rooms.iter().map(|r| &r.name).collect::<Vec<_>>()
                     ));
@@ -140,7 +152,9 @@ pub fn run(
                     climate = fetched_climate;
                     buttons = None; // force a redraw with the fresh room list/weather/climate
                 }
-                Err(e) => crate::debug_log::event(format!("kiosk: failed to fetch dashboard data: {e:?}")),
+                Err(e) => crate::debug_log::event(format!(
+                    "kiosk: failed to fetch dashboard data: {e:?} (free heap: {free_heap} total, {free_internal_heap} internal)"
+                )),
             }
             last_room_refresh = std::time::Instant::now();
         }
@@ -174,15 +188,29 @@ pub fn run(
         // means a toggle confirms as soon as the real round trip completes - usually well under
         // 2s - instead of always waiting the full cooldown before looking "settled".
         while let Ok((area_id, turn_on, result)) = result_rx.try_recv() {
-            if let Err(e) = result {
-                log::warn!("kiosk: set_room_lights({area_id}, {turn_on}) failed: {e}");
-                if let Some(room) = rooms.iter_mut().find(|r| r.area_id == area_id) {
-                    room.is_on = !turn_on; // revert the optimistic flip - the call never took effect
+            match result {
+                Ok(()) => {
+                    // The call really did succeed, so the optimistic flip was correct - confirm
+                    // it (un-mute) now rather than waiting out the rest of the cooldown.
+                    if let Some(rect) = buttons.as_ref().and_then(|b| b.rect_for(&area_id)) {
+                        let is_on = rooms.iter().find(|r| r.area_id == area_id).map(|r| r.is_on).unwrap_or(turn_on);
+                        crate::display::update_toggle(&mut display, rect, is_on, false);
+                    }
                 }
-            }
-            if let Some(rect) = buttons.as_ref().and_then(|b| b.rect_for(&area_id)) {
-                let is_on = rooms.iter().find(|r| r.area_id == area_id).map(|r| r.is_on).unwrap_or(turn_on);
-                crate::display::update_toggle(&mut display, rect, is_on, false);
+                Err(e) => {
+                    // Previously this reverted `is_on` to `!turn_on` - a guess. That guess can be
+                    // wrong: a timed-out/failed WebSocket round trip (which is exactly the shape
+                    // of thing seen under memory pressure on long runs) doesn't necessarily mean
+                    // the `call_service` never reached HA - it may have gone through just fine
+                    // and only our client's confirmation was lost, which would make "confidently
+                    // revert to the opposite" actively misleading (this is the state-mismatch bug
+                    // reported after an hour-long run: HA said on, device said off). Instead of
+                    // guessing, ask HA directly: force the next refresh to happen on the very
+                    // next tick. The toggle is left in its current muted state (not reverted, not
+                    // confirmed) until that refresh redraws everything with ground truth.
+                    log::warn!("kiosk: set_room_lights({area_id}, {turn_on}) failed: {e} - forcing an immediate refresh instead of guessing the outcome");
+                    last_room_refresh = Instant::now() - ROOM_REFRESH_INTERVAL;
+                }
             }
         }
 
