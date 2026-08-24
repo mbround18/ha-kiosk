@@ -6,7 +6,7 @@ use embedded_graphics::primitives::{Circle, CornerRadii, PrimitiveStyle, Rectang
 use embedded_graphics::text::{Alignment, Text};
 
 use firmware_core::home::{format_climate_line, format_weather_line, Climate, Room, Weather};
-use firmware_core::layout::{pick_layout, COLUMNS};
+use firmware_core::layout::{fit_text_scale, pick_layout, COLUMNS};
 
 use super::{Display, HEIGHT, WIDTH};
 
@@ -108,8 +108,14 @@ pub fn show_rooms(
 ) -> anyhow::Result<KioskButtons> {
     display.fill(theme_background());
 
+    // Content here comes straight from live HA data (weather condition names, climate mode
+    // breakdowns) whose length isn't under our control - a fixed text scale would eventually run
+    // some combination off the edge of the screen, so both lines pick the largest scale (down to
+    // 1) that actually fits the available width instead.
+    let header_max_width = (WIDTH as i32) - 2 * OUTER_MARGIN;
     if let Some(line) = weather.map(format_weather_line).filter(|l| !l.is_empty()) {
-        draw_text(display, &line, Point::new((WIDTH / 2) as i32, 40), theme_text(), Alignment::Center, 2);
+        let scale = fit_text_scale(&line, 2, header_max_width);
+        draw_text(display, &line, Point::new((WIDTH / 2) as i32, 40), theme_text(), Alignment::Center, scale);
     }
     draw_text(display, "Rooms", Point::new((WIDTH / 2) as i32, 115), theme_accent(), Alignment::Center, 2);
 
@@ -117,13 +123,15 @@ pub fn show_rooms(
         .map(|c| format_climate_line(c, weather.map(|w| w.unit.as_str()).unwrap_or("°F")))
         .filter(|l| !l.is_empty())
     {
+        let footer_max_width = (WIDTH as i32) - OUTER_MARGIN;
+        let scale = fit_text_scale(&line, 1, footer_max_width);
         draw_text(
             display,
             &line,
             Point::new((WIDTH as i32) - OUTER_MARGIN, (HEIGHT as i32) - FOOTER_HEIGHT / 2 + 7),
             theme_text(),
             Alignment::Right,
-            1,
+            scale,
         );
     }
 

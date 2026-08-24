@@ -13,6 +13,27 @@ pub const MIN_ROW_HEIGHT: i32 = 44;
 /// board's 5-room test home).
 pub const MAX_ROW_HEIGHT: i32 = 92;
 
+/// Width in pixels of one character of the kiosk's font (`FONT_10X20`, embedded_graphics's
+/// built-in ASCII bitmap font - see `firmware::display::kiosk`) at scale 1, before the
+/// `PixelDoubler`-style integer-replication scaling used for bigger text.
+pub const GLYPH_WIDTH: i32 = 10;
+
+pub fn text_width(text: &str, scale: i32) -> i32 {
+    text.chars().count() as i32 * GLYPH_WIDTH * scale
+}
+
+/// The largest scale (down to 1) at which `text` fits within `max_width` pixels, starting from
+/// `max_scale`. Lets header/footer text that varies with live data (weather condition names,
+/// climate mode breakdowns, etc.) shrink automatically instead of running off the edge of the
+/// screen, rather than always rendering at a fixed scale regardless of content length.
+pub fn fit_text_scale(text: &str, max_scale: i32, max_width: i32) -> i32 {
+    let mut scale = max_scale.max(1);
+    while scale > 1 && text_width(text, scale) > max_width {
+        scale -= 1;
+    }
+    scale
+}
+
 pub struct Layout {
     pub text_scale: i32,
     pub row_height: i32,
@@ -77,5 +98,31 @@ mod tests {
     fn zero_rooms_does_not_panic_and_uses_the_max_profile() {
         let layout = pick_layout(0, 450);
         assert_eq!(layout.row_height, MAX_ROW_HEIGHT);
+    }
+
+    #[test]
+    fn fit_text_scale_keeps_max_scale_when_it_fits() {
+        // "72F Sunny" - 9 chars * 10px * 2 = 180px, well under a typical 964px header width.
+        assert_eq!(fit_text_scale("72F Sunny", 2, 964), 2);
+    }
+
+    #[test]
+    fn fit_text_scale_shrinks_when_too_wide_for_max_scale() {
+        // 60 chars * 10px * 2 = 1200px > 964px, but * 1 = 600px fits.
+        let text = "x".repeat(60);
+        assert_eq!(fit_text_scale(&text, 2, 964), 1);
+    }
+
+    #[test]
+    fn fit_text_scale_never_goes_below_one_even_if_still_too_wide() {
+        let text = "x".repeat(500);
+        assert_eq!(fit_text_scale(&text, 2, 964), 1);
+    }
+
+    #[test]
+    fn text_width_scales_linearly_with_scale_and_length() {
+        assert_eq!(text_width("hello", 1), 50);
+        assert_eq!(text_width("hello", 2), 100);
+        assert_eq!(text_width("", 2), 0);
     }
 }
