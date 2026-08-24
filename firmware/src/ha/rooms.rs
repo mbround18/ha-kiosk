@@ -106,21 +106,45 @@ impl HaWsSession {
     /// treats every `render_template` as a live subscription that would keep re-sending on
     /// change).
     ///
-    /// Explicitly unsubscribes once the one value this is actually used for has arrived, rather
-    /// than just letting every one of these subscriptions (one per room, plus weather/climate/
-    /// clock - several per session) ride until the whole connection drops at the end of
-    /// `fetch_dashboard_data`. Leaving them open was the cause of a real heap leak, confirmed via
-    /// on-device serial logs: every session's `esp_websocket_client_close` was logging
-    /// "Connection terminated while waiting for clean TCP close" / "unexpected data readable on
-    /// socket" - HA pushing an unread update on one of these still-live subscriptions right as
-    /// the connection was closing, which the underlying C client doesn't handle cleanly. Measured
-    /// on hardware: internal heap dropping ~750 bytes on almost every 15s refresh cycle, which
-    /// exhausts this board's ~220KB internal heap in roughly 2 hours - the "state goes stale
-    /// after a few hours" bug this was written to fix.
+    /// Explicitly unsubscribes once this call is done with its subscription - whether it got
+    /// the value it needed or failed/timed out - rather than just letting every one of these
+    /// subscriptions (one per room, plus weather/climate/clock - several per session) ride
+    /// forever. Originally written (see git history) on the assumption a failed session would
+    /// get dropped and reconnected soon anyway, back when every refresh reconnected from
+    /// scratch; that stopped being true once `net::kiosk` moved to one persistent `HaWsSession`
+    /// reused for the kiosk's entire runtime, and the original version only sent this unsubscribe
+    /// after successfully receiving both the ack and the event (i.e. never on a `?` early
+    /// return) - so a call that timed out (confirmed on hardware: HA's `climate` render started
+    /// timing out on nearly every cycle after a while) leaked one dangling, still-live
+    /// subscription per failure, for the rest of the session's now much longer lifetime. Each one
+    /// keeps HA pushing updates our code will never consume, which is exactly the kind of slow
+    /// per-cycle heap loss (~200 bytes/cycle, not zero, when this was still unfixed) this whole
+    /// persistent-connection design was meant to eliminate.
     fn render_template(&mut self, template: &str) -> anyhow::Result<Value> {
         let id = self.next_id;
         self.next_id += 1;
+        let result = self.render_template_body(id, template);
 
+        // Fire-and-forget, and always sent - even when `result` above is an `Err` - since HA
+        // creates the subscription as soon as it processes the initial `render_template` send,
+        // independent of whether this session ever saw its ack or event. That ack isn't worth an
+        // extra round trip to wait for here either way - there's nothing left to do with this
+        // subscription regardless of outcome, the goal is just to stop it from pushing anything
+        // more for the rest of this (long-lived) session.
+        let unsubscribe_id = self.next_id;
+        self.next_id += 1;
+        if let Err(e) = self.send_raw(&serde_json::json!({
+            "id": unsubscribe_id,
+            "type": "unsubscribe_events",
+            "subscription": id,
+        })) {
+            log::warn!("render_template: failed to unsubscribe from subscription {id}: {e}");
+        }
+
+        result
+    }
+
+    fn render_template_body(&mut self, id: u32, template: &str) -> anyhow::Result<Value> {
         self.send_raw(&serde_json::json!({
             "id": id,
             "type": "render_template",
@@ -139,22 +163,7 @@ impl HaWsSession {
         let event = self.wait_for(Duration::from_secs(10), move |msg| {
             msg["id"].as_u64() == Some(id as u64) && msg["type"] == "event"
         })?;
-        let result = event["event"]["result"].clone();
-
-        // Fire-and-forget: HA acks this too, but that ack isn't worth an extra round trip since
-        // there's nothing left to do with this subscription either way - the goal is just to
-        // stop it from pushing anything more once this session closes.
-        let unsubscribe_id = self.next_id;
-        self.next_id += 1;
-        if let Err(e) = self.send_raw(&serde_json::json!({
-            "id": unsubscribe_id,
-            "type": "unsubscribe_events",
-            "subscription": id,
-        })) {
-            log::warn!("render_template: failed to unsubscribe from subscription {id}: {e}");
-        }
-
-        Ok(result)
+        Ok(event["event"]["result"].clone())
     }
 
     fn send_raw(&mut self, payload: &Value) -> anyhow::Result<()> {

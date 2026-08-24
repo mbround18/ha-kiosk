@@ -40,6 +40,19 @@ const FULL_BRIGHTNESS_PERCENT: u8 = 100;
 /// restarting, a dropped packet) doesn't flash the warning; a real outage lasting multiple
 /// cycles is what this is meant to catch.
 const STALE_AFTER_FAILURES: u32 = 3;
+/// How long the persistent `HaWsSession` (see below) is allowed to live before it's proactively
+/// recycled, even if every call on it keeps succeeding. Reconnecting-per-refresh-cycle was a real
+/// measured leak (~750-800 bytes/cycle) fully root-caused and fixed; after that fix, on-device
+/// logs still show a much smaller (~150-160 bytes/cycle) residual decline that doesn't come from
+/// anything in this codebase's own subscription/cleanup logic - consistent with something at the
+/// underlying `esp_websocket_client`/TLS layer itself (periodic keepalive traffic, most likely)
+/// rather than an app-level bug to keep chasing. Rather than let that residual run unbounded for
+/// the device's entire uptime, this puts a ceiling on it: at the measured worst-case rate, one
+/// hour of the persistent connection costs at most a few tens of KB, comfortably recovered by a
+/// clean reconnect (itself now cheap and side-effect-free, since the earlier leak fixes mean nothing
+/// is left dangling when a session is dropped) long before this board's ~220KB internal heap
+/// budget is ever at risk.
+const SESSION_MAX_AGE: Duration = Duration::from_secs(60 * 60);
 
 pub fn run(
     peripherals: Peripherals,
@@ -145,6 +158,10 @@ pub fn run(
             .stack_size(16 * 1024)
             .spawn(move || {
                 let mut session: Option<rooms::HaWsSession> = None;
+                // When the current `session` was established - `None` alongside `session` being
+                // `None` too. Compared against `SESSION_MAX_AGE` below to proactively recycle a
+                // long-lived connection regardless of whether it's still working.
+                let mut session_established_at: Option<Instant> = None;
                 loop {
                     // Waiting up to `ROOM_REFRESH_INTERVAL` for an explicit request (a tap's
                     // light toggle, or a kicked refresh after one fails - see below) doubles as
@@ -156,11 +173,25 @@ pub fn run(
                         Err(mpsc::RecvTimeoutError::Disconnected) => break, // kiosk::run's loop is gone
                     };
 
+                    if session.is_some()
+                        && session_established_at.is_some_and(|at| at.elapsed() >= SESSION_MAX_AGE)
+                    {
+                        crate::debug_log::event(
+                            "kiosk: recycling HA connection after reaching SESSION_MAX_AGE (routine maintenance, not a failure)"
+                                .to_string(),
+                        );
+                        session = None;
+                    }
+
                     if session.is_none() {
                         session = match rooms::HaWsSession::connect(&worker_ha.base_url, &worker_ha.access_token) {
-                            Ok(s) => Some(s),
+                            Ok(s) => {
+                                session_established_at = Some(Instant::now());
+                                Some(s)
+                            }
                             Err(e) => {
                                 crate::debug_log::event(format!("kiosk: HA reconnect failed: {e:?}"));
+                                session_established_at = None;
                                 None
                             }
                         };
@@ -186,6 +217,7 @@ pub fn run(
                             };
                             if result.is_err() {
                                 session = None; // this connection is suspect - reconnect fresh next time
+                                session_established_at = None;
                             }
                             match &result {
                                 Ok((fetched_rooms, ..)) => crate::debug_log::event(format!(
@@ -206,6 +238,7 @@ pub fn run(
                             };
                             if result.is_err() {
                                 session = None;
+                                session_established_at = None;
                             }
                             response_tx.send(HaResponse::LightsResult(area_id, turn_on, result))
                         }
