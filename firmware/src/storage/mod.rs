@@ -1,5 +1,10 @@
 use esp_idf_svc::nvs::{EspDefaultNvsPartition, EspNvs, NvsDefault};
 
+/// Defined in `firmware_core::portal_api` (not here) so it stays usable from that crate's
+/// hardware-independent, host-testable `StatusResponse::from_state` without depending on
+/// anything ESP-IDF-specific - see that module's doc comment.
+pub use firmware_core::portal_api::SetupState;
+
 const NAMESPACE: &str = "kiosk_cfg";
 
 /// data-model.md: WifiCredentials
@@ -20,14 +25,6 @@ pub struct HomeAssistantConnection {
 pub struct DashboardSelection {
     pub url_path: String,
     pub title: String,
-}
-
-/// data-model.md: SetupState (derived, not persisted as its own entity)
-#[derive(Debug, Clone, Copy, Default, serde::Serialize)]
-pub struct SetupState {
-    pub wifi_configured: bool,
-    pub ha_configured: bool,
-    pub dashboard_selected: bool,
 }
 
 pub struct Storage {

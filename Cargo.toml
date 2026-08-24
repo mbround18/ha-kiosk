@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["flasher"]
+members = ["flasher", "firmware-core"]
 # `firmware` is deliberately NOT a workspace member: it's an ESP-IDF (embedded, riscv32imafc-esp-
 # espidf target) crate pinned to its own toolchain via firmware/rust-toolchain.toml, with a heavy
 # native (cmake/esp-idf) build process and its own Cargo.lock. Folding it into this workspace

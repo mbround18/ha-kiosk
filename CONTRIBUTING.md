@@ -6,11 +6,12 @@ Development notes for working on this repo. If you're just looking to use a devi
 ## Repo layout
 
 ```
-firmware/     ESP32-P4 firmware (Rust, esp-idf-svc/std) + portal-ui/ (the setup page, React+Vite)
-flasher/      Host-side CLI: build+flash+auto-provision (see README.md's "flasher" section)
-tools/        Local dev tooling not needed to build/flash (e.g. debug-logging/'s syslog-ng compose)
-specs/        spec-kit feature specs/plans for this project's formal requirements process
-Cargo.toml    Workspace root for host-side tools (flasher) - see the note below on firmware
+firmware/       ESP32-P4 firmware (Rust, esp-idf-svc/std) + portal-ui/ (the setup page, React+Vite)
+firmware-core/  Hardware-independent logic shared with firmware/ - see "Testing" below
+flasher/        Host-side CLI: build+flash+auto-provision (see README.md's "flasher" section)
+tools/          Local dev tooling not needed to build/flash (e.g. debug-logging/'s syslog-ng compose)
+specs/          spec-kit feature specs/plans for this project's formal requirements process
+Cargo.toml      Workspace root for host-side tools (flasher, firmware-core) - see the note below
 ```
 
 **`firmware` is intentionally not a workspace member.** It's an ESP-IDF (embedded,
@@ -19,7 +20,9 @@ Cargo.toml    Workspace root for host-side tools (flasher) - see the note below 
 `Cargo.lock`. Folding it into the root workspace would force a single unified lockfile/toolchain
 across a host-target CLI tool and an embedded target - real risk of dependency-resolution or
 toolchain drift for very little benefit. Build it independently, as documented below (or via
-`flasher`, which just shells out to the same commands).
+`flasher`, which just shells out to the same commands). `firmware-core` is a plain dependency of
+`firmware` (a regular path dependency, not a workspace membership question) - see "Testing" below
+for why it exists as a separate crate at all.
 
 ## Prerequisites
 
@@ -58,6 +61,29 @@ so adjust that if you use it.
 board's chip revision requires bootloader-level sdkconfig options
 (`CONFIG_ESP32P4_SELECTS_REV_LESS_V3`/`CONFIG_ESP32P4_REV_MIN_100`, already set in
 `firmware/sdkconfig.defaults`) that only take effect if the bootloader itself is reflashed too.
+
+## Testing
+
+`firmware`'s `[[bin]]` has `harness = false` (an esp-idf-template default, needed to avoid a
+rust-analyzer issue and because there's no meaningful way to run a std test harness process on
+the embedded target itself anyway). Turns out this doesn't just skip *running* `#[test]`
+functions declared there - it skips *compiling* `#[cfg(test)]` code for that target entirely, so
+`cargo test`/`cargo check --tests` inside `firmware/` silently look fine even when a test module
+has actual compile errors (a stale, never-actually-checked `mod tests` block with a missing `use
+super::*;` was sitting in `firmware/src/portal_api/mod.rs` for exactly this reason before it was
+moved).
+
+The fix is `firmware-core`: everything that doesn't actually need ESP-IDF/hardware (the captive
+portal's JSON contract types, weather/climate text formatting, the room-grid layout math) lives
+there instead, as a plain host-target library crate and a real member of the root workspace.
+`firmware` depends on it as an ordinary path dependency and re-exports what it needs.
+
+```sh
+cargo test --workspace   # runs firmware-core's tests (and flasher's) normally
+```
+
+If you add logic to `firmware` that doesn't actually touch `esp_idf_svc`/hardware, consider
+whether it belongs in `firmware-core` instead, specifically so it can be tested this way.
 
 ## Debugging on-device
 

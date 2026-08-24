@@ -5,8 +5,10 @@ use embedded_graphics::prelude::*;
 use embedded_graphics::primitives::{Circle, CornerRadii, PrimitiveStyle, Rectangle, RoundedRectangle};
 use embedded_graphics::text::{Alignment, Text};
 
+use firmware_core::home::{format_climate_line, format_weather_line, Climate, Room, Weather};
+use firmware_core::layout::{pick_layout, COLUMNS};
+
 use super::{Display, HEIGHT, WIDTH};
-use crate::ha::rooms::{Climate, Room, Weather};
 
 /// Converts an 8-bit-per-channel color (as given in a hex palette) to this display's native
 /// 5-6-5 format - `Rgb565::new` itself expects values already in that native bit depth, which is
@@ -54,42 +56,6 @@ const HEADER_HEIGHT: i32 = 150;
 const FOOTER_HEIGHT: i32 = 36;
 const OUTER_MARGIN: i32 = 30;
 const COLUMN_GAP: i32 = 40;
-const COLUMNS: i32 = 2;
-
-/// Row sizing for the room grid, computed continuously from how many rooms need to fit (see
-/// `pick_layout`) rather than a fixed handful of tiers - a 5-room home and a 15-room home each
-/// get the largest text/toggle that still lets every room fit in the available vertical space,
-/// down to `MIN_ROW_HEIGHT`. Only an unreasonably large area count would still overflow past
-/// that floor, in which case the excess is simply not shown.
-struct Layout {
-    text_scale: i32,
-    row_height: i32,
-    toggle_width: u32,
-    toggle_height: u32,
-}
-
-/// Below this, `FONT_10X20` at scale 1 (20px tall) plus a usable toggle no longer fits
-/// comfortably - the floor this reactive sizing shrinks toward for a large room count.
-const MIN_ROW_HEIGHT: i32 = 44;
-/// Above this, more vertical room just adds dead space rather than more legibility - the ceiling
-/// this reactive sizing grows toward for a small room count (matches what looked right for this
-/// board's 5-room test home).
-const MAX_ROW_HEIGHT: i32 = 92;
-
-fn pick_layout(room_count: usize, available_height: i32) -> Layout {
-    let room_count = (room_count as i32).max(1);
-    let rows_needed = (room_count + COLUMNS - 1) / COLUMNS;
-    let row_height = (available_height / rows_needed).clamp(MIN_ROW_HEIGHT, MAX_ROW_HEIGHT);
-
-    // FONT_10X20 is 20px tall at scale 1, 40px at scale 2 - only step up to 2x once the row has
-    // comfortable room for it (glyph height + padding + a same-height toggle).
-    let text_scale = if row_height >= 80 { 2 } else { 1 };
-
-    let toggle_height = (row_height - 14).clamp(28, 64) as u32;
-    let toggle_width = (toggle_height * 2).max(60);
-
-    Layout { text_scale, row_height, toggle_width, toggle_height }
-}
 
 struct RoomButton {
     area_id: String,
@@ -199,73 +165,6 @@ pub fn show_rooms(
     display.flush()?;
 
     Ok(KioskButtons(buttons))
-}
-
-/// e.g. "72F Sunny  |  Avg Home 70F  |  Avg Humidity 45%" - each piece (current temp/condition,
-/// average temp, average humidity) is only included if HA actually provided it (no weather
-/// entity, or no matching sensors, are both unremarkable configurations rather than errors worth
-/// surfacing). Sticks to plain ASCII since `FONT_10X20` (embedded_graphics's built-in ascii
-/// font) has no glyphs for `°` or `·`.
-fn format_weather_line(w: &Weather) -> String {
-    let unit_letter = w.unit.trim_start_matches('°');
-
-    let mut current = Vec::new();
-    if let Some(t) = w.temp {
-        current.push(format!("{:.0}{unit_letter}", t));
-    }
-    if !w.condition.is_empty() && w.condition != "Unknown" {
-        current.push(w.condition.clone());
-    }
-
-    let mut parts = vec![current.join(" ")];
-    if let Some(avg) = w.avg_home_temp {
-        parts.push(format!("Avg Home {:.0}{unit_letter}", avg));
-    }
-    if let Some(humidity) = w.avg_home_humidity {
-        parts.push(format!("Avg Humidity {:.0}%", humidity));
-    }
-
-    parts.into_iter().filter(|p| !p.is_empty()).collect::<Vec<_>>().join("  |  ")
-}
-
-/// e.g. "AC 74F  |  2xCool 1xOff" - compact by design (bottom-right corner, one line, small
-/// text): a count prefix (`2x`) only appears for a mode with more than one unit in it, so a
-/// single-AC home just reads e.g. "AC 74F  |  Cool" instead of "1xCool".
-fn format_climate_line(c: &Climate, unit_letter: &str) -> String {
-    let mut parts = Vec::new();
-    if let Some(t) = c.avg_current_temp {
-        parts.push(format!("AC {:.0}{unit_letter}", t));
-    }
-    if !c.mode_counts.is_empty() {
-        let modes: Vec<String> = c
-            .mode_counts
-            .iter()
-            .map(|(mode, count)| {
-                let label = climate_mode_label(mode);
-                if *count > 1 {
-                    format!("{count}x{label}")
-                } else {
-                    label.to_string()
-                }
-            })
-            .collect();
-        parts.push(modes.join(" "));
-    }
-    parts.join("  |  ")
-}
-
-/// Short display label for an HA `climate.*` entity's `hvac_mode` state - kept to one word,
-/// since this whole line has to fit in one small corner of the screen.
-fn climate_mode_label(hvac_mode: &str) -> &str {
-    match hvac_mode {
-        "off" => "Off",
-        "heat" => "Heat",
-        "cool" => "Cool",
-        "heat_cool" | "auto" => "Auto",
-        "dry" => "Dry",
-        "fan_only" => "Fan",
-        _ => "?",
-    }
 }
 
 /// Redraws one room's toggle in its new (optimistic) position right after a tap, `muted` (a

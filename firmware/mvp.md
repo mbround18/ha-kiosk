@@ -4,6 +4,11 @@ Project-level docs (customer-facing README, CONTRIBUTING, compatibility matrix, 
 host tool) now live at the repo root - see [`../README.md`](../README.md) and
 [`../CONTRIBUTING.md`](../CONTRIBUTING.md). This file stays focused on firmware feature status.
 
+**Tests**: hardware-independent logic (JSON contract types, weather/climate formatting, room-grid
+layout math) now lives in `../firmware-core/` and is covered by 27 unit tests, runnable normally
+via `cargo test --workspace` from the repo root - see CONTRIBUTING.md's "Testing" section for why
+that split exists (`firmware`'s own `[[bin]]` can't actually run `#[test]`s at all).
+
 ## Working
 - Current weather + whole-home average temperature + average humidity shown above the room list (fetched via HA `render_template`, refreshed every 15s along with rooms)
   - Average temp/humidity excludes non-ambient readings: values outside 32-120°F (0-49°C) or 0-100% are dropped, and sensors named like an appliance (oven, grill, stove, smoker, dryer, washer, fridge, freezer, dishwasher, kettle, toaster, microwave) are excluded by name too

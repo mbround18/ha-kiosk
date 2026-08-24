@@ -721,8 +721,17 @@ dependencies = [
  "embedded-svc",
  "embuild",
  "esp-idf-svc",
+ "firmware-core",
  "log",
  "qrcode",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "firmware-core"
+version = "0.1.0"
+dependencies = [
  "serde",
  "serde_json",
 ]

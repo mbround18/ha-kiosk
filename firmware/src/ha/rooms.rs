@@ -18,42 +18,10 @@ use embedded_svc::ws::FrameType;
 use esp_idf_svc::ws::client::{EspWebSocketClient, EspWebSocketClientConfig, WebSocketEventType};
 use serde_json::Value;
 
-pub struct Room {
-    pub area_id: String,
-    pub name: String,
-    /// Whether at least one light in this area is currently on - drives the toggle switch's
-    /// initial position in `display::kiosk`. Kept in sync optimistically by `net::kiosk` after a
-    /// tap (rather than waiting for the next refresh) so the toggle visibly flips immediately.
-    pub is_on: bool,
-}
-
-/// Current weather + a whole-home average indoor temperature, both nice-to-haves shown above
-/// the room list. `unit` is whatever `weather.attributes.temperature_unit` HA reports (typically
-/// `°F` or `°C`) and is assumed to also apply to `avg_home_temp` - a real HA instance can in
-/// theory mix sensor units, but in practice a single home's temperature sensors are consistently
-/// in whatever unit system the instance is configured for, so per-sensor unit conversion is
-/// skipped as unnecessary complexity for this MVP.
-pub struct Weather {
-    pub condition: String,
-    pub temp: Option<f64>,
-    pub unit: String,
-    pub avg_home_temp: Option<f64>,
-    /// Average of every `sensor.*` entity with `device_class: humidity`, as a plain percentage
-    /// (humidity has no unit-system ambiguity the way temperature does).
-    pub avg_home_humidity: Option<f64>,
-}
-
-/// A compact summary of every `climate.*` entity ("AC"/thermostat) in the home - shown in the
-/// bottom-right corner of the kiosk screen. `avg_current_temp` averages their sensed (not
-/// target) temperature the same way `Weather::avg_home_temp` averages plain sensors, since
-/// that's the actual measured room condition; `mode_counts` is how many units are in each HVAC
-/// mode (`off`/`heat`/`cool`/`heat_cool`/`auto`/`dry`/`fan_only`) so a mixed-mode home (one unit
-/// cooling, another off) shows a compact breakdown instead of a single misleading mode.
-pub struct Climate {
-    pub avg_current_temp: Option<f64>,
-    /// `(hvac_mode, count)`, sorted by count descending then mode name for stable output.
-    pub mode_counts: Vec<(String, u32)>,
-}
+/// `Room`/`Weather`/`Climate` are plain data with no ESP-IDF dependency, so they're defined in
+/// `firmware_core::home` (a host-testable crate) instead of here - this module is just the
+/// WebSocket fetching logic that populates them.
+pub use firmware_core::home::{Climate, Room, Weather};
 
 /// A single request/response HA WebSocket session - connects, authenticates, and lets the
 /// caller make any number of `call` requests before dropping (which closes the connection).

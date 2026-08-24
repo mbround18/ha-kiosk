@@ -25,8 +25,13 @@ pub fn find_board_port(explicit: Option<&str>) -> anyhow::Result<String> {
     if let Some(p) = explicit {
         return Ok(p.to_string());
     }
+    select_port(&list_usb_ports()?)
+}
 
-    let ports = list_usb_ports()?;
+/// The actual selection algorithm, separated from `list_usb_ports`'s real hardware enumeration
+/// so it's unit-testable against synthetic port lists (see the tests below) without needing a
+/// physical device connected.
+fn select_port(ports: &[SerialPortInfo]) -> anyhow::Result<String> {
     let espressif: Vec<&SerialPortInfo> = ports
         .iter()
         .filter(|p| matches!(&p.port_type, SerialPortType::UsbPort(info) if info.vid == ESPRESSIF_VID))
@@ -62,4 +67,59 @@ pub fn print_ports() -> anyhow::Result<()> {
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn usb_port(name: &str, vid: u16) -> SerialPortInfo {
+        SerialPortInfo {
+            port_name: name.to_string(),
+            port_type: SerialPortType::UsbPort(serialport::UsbPortInfo {
+                vid,
+                pid: 0x1001,
+                serial_number: None,
+                manufacturer: None,
+                product: None,
+            }),
+        }
+    }
+
+    #[test]
+    fn no_ports_is_an_error() {
+        assert!(select_port(&[]).is_err());
+    }
+
+    #[test]
+    fn single_espressif_port_is_picked_automatically() {
+        let ports = [usb_port("/dev/ttyACM0", ESPRESSIF_VID)];
+        assert_eq!(select_port(&ports).unwrap(), "/dev/ttyACM0");
+    }
+
+    #[test]
+    fn espressif_port_is_picked_even_among_other_usb_devices() {
+        let ports = [usb_port("/dev/ttyUSB0", 0x0403), usb_port("/dev/ttyACM0", ESPRESSIF_VID)];
+        assert_eq!(select_port(&ports).unwrap(), "/dev/ttyACM0");
+    }
+
+    #[test]
+    fn multiple_espressif_ports_is_an_error() {
+        let ports = [usb_port("/dev/ttyACM0", ESPRESSIF_VID), usb_port("/dev/ttyACM1", ESPRESSIF_VID)];
+        let err = select_port(&ports).unwrap_err().to_string();
+        assert!(err.contains("/dev/ttyACM0"));
+        assert!(err.contains("/dev/ttyACM1"));
+    }
+
+    #[test]
+    fn single_non_espressif_port_falls_back_automatically() {
+        let ports = [usb_port("/dev/ttyUSB0", 0x0403)];
+        assert_eq!(select_port(&ports).unwrap(), "/dev/ttyUSB0");
+    }
+
+    #[test]
+    fn multiple_non_espressif_ports_is_an_error() {
+        let ports = [usb_port("/dev/ttyUSB0", 0x0403), usb_port("/dev/ttyUSB1", 0x0403)];
+        assert!(select_port(&ports).is_err());
+    }
 }
