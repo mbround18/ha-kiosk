@@ -2,6 +2,8 @@
 .claude/settings.local.json
 .env
 /certs
+__pycache__/
+*.pyc
 
 # Vendor board documentation bundle (schematics, datasheets, manuals) - not ours to redistribute.
 # Kept locally for reference only; never commit.

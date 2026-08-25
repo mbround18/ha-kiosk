@@ -162,6 +162,12 @@ pub fn run(
                 // `None` too. Compared against `SESSION_MAX_AGE` below to proactively recycle a
                 // long-lived connection regardless of whether it's still working.
                 let mut session_established_at: Option<Instant> = None;
+                // Diagnostic-only (see `debug_log::log_heap_block_counts`) - logs the allocated-
+                // block count every few refresh cycles rather than every single one, so the trend
+                // (does it climb by ~1/cycle in lockstep with the byte decline, or not) is visible
+                // in a few log lines instead of drowning `/api/debug` in a line every 15s cycle.
+                let mut refresh_count: u32 = 0;
+                const HEAP_BLOCK_COUNT_LOG_EVERY_N_REFRESHES: u32 = 4;
                 loop {
                     // Waiting up to `ROOM_REFRESH_INTERVAL` for an explicit request (a tap's
                     // light toggle, or a kicked refresh after one fails - see below) doubles as
@@ -228,6 +234,13 @@ pub fn run(
                                 Err(e) => crate::debug_log::event(format!(
                                     "kiosk: failed to fetch dashboard data: {e:?} (free heap: {free_heap} total, {free_internal_heap} internal)"
                                 )),
+                            }
+                            refresh_count += 1;
+                            if refresh_count % HEAP_BLOCK_COUNT_LOG_EVERY_N_REFRESHES == 0 {
+                                crate::debug_log::log_heap_block_counts(
+                                    esp_idf_svc::sys::MALLOC_CAP_INTERNAL,
+                                    "internal",
+                                );
                             }
                             response_tx.send(HaResponse::Dashboard(result))
                         }

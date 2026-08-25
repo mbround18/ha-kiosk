@@ -1,0 +1,15 @@
+services:
+  heap-monitor:
+    image: python:3.12-alpine
+    command: ["python", "/app/scrape.py"]
+    environment:
+      # Update this if the device's DHCP lease changes - it has, more than once, during
+      # development. A router-level DHCP reservation for the kiosk's MAC address avoids needing
+      # to touch this mid-collection.
+      KIOSK_URL: "http://192.168.1.220/api/debug"
+      POLL_INTERVAL_SECONDS: "30"
+      OUT_PATH: "/data/heap.csv"
+    volumes:
+      - ./scrape.py:/app/scrape.py:ro
+      - ./data:/data
+    restart: unless-stopped
